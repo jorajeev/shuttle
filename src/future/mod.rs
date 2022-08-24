@@ -13,6 +13,8 @@ use std::pin::Pin;
 use std::result::Result;
 use std::task::{Context, Poll};
 
+pub mod batch_semaphore;
+
 /// Spawn a new async task that the executor will run to completion.
 pub fn spawn<T, F>(fut: F) -> JoinHandle<T>
 where
