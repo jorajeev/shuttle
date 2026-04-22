@@ -101,5 +101,16 @@ pub fn lock_scaling_sync_benchmark(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, lock_sync_benchmark, lock_scaling_sync_benchmark);
+// To generate a flamegraph for this benchmark run:
+//   cargo flamegraph --bench lock --features bench-no-vector-clocks
+// (requires cargo-flamegraph: `cargo install flamegraph`)
+fn criterion_config() -> Criterion {
+    Criterion::default()
+}
+
+criterion_group! {
+    name = benches;
+    config = criterion_config();
+    targets = lock_sync_benchmark, lock_scaling_sync_benchmark
+}
 criterion_main!(benches);

@@ -71,3 +71,7 @@ harness = false
 [[bench]]
 name = "create"
 harness = false
+
+[[bench]]
+name = "baseline"
+harness = false
