@@ -16,10 +16,11 @@ use std::any::Any;
 use std::backtrace::Backtrace;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::panic::Location;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Waker};
@@ -255,6 +256,29 @@ impl PartialEq for TaskSignature {
 
 impl Eq for TaskSignature {}
 
+/// The execution body of a task: either a coroutine-based continuation or a directly-polled future.
+pub(super) enum TaskBody {
+    /// Coroutine-based execution (preemptive mode). The future is wrapped in a polling loop inside
+    /// a `PooledContinuation`, which can suspend at any sync primitive boundary.
+    Continuation {
+        inner: Rc<RefCell<PooledContinuation>>,
+        yielder: *const Yielder<ContinuationInput, ContinuationOutput>,
+    },
+    /// Direct-poll execution (non-preemptive mode). The future is polled directly from the
+    /// execution loop without a coroutine wrapper. Sync primitives cannot context-switch within
+    /// a single poll; blocking operations will panic with a helpful error.
+    Future(Rc<RefCell<Pin<Box<dyn Future<Output = ()>>>>>),
+}
+
+impl fmt::Debug for TaskBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskBody::Continuation { inner, .. } => f.debug_struct("Continuation").field("inner", inner).finish(),
+            TaskBody::Future(_) => f.debug_struct("Future").finish_non_exhaustive(),
+        }
+    }
+}
+
 /// A `Task` represents a user-level unit of concurrency. Each task has an `id` that is unique within
 /// the execution, and a `state` reflecting whether the task is runnable (enabled) or not.
 #[derive(Debug)]
@@ -265,8 +289,7 @@ pub struct Task {
     pub(super) detached: bool,
     park_state: ParkState,
 
-    pub(super) continuation: Rc<RefCell<PooledContinuation>>,
-    pub(super) yielder: *const Yielder<ContinuationInput, ContinuationOutput>,
+    pub(super) body: TaskBody,
 
     pub(crate) clock: VectorClock,
 
@@ -332,7 +355,7 @@ impl Task {
         continuation.initialize(f);
         let yielder = continuation.yielder;
         let waker = make_waker(id);
-        let continuation = Rc::new(RefCell::new(continuation));
+        let inner = Rc::new(RefCell::new(continuation));
 
         let step_span =
             error_span!(parent: parent_span_id.clone(), "step", task = format!("{:?}", id), i = field::Empty);
@@ -345,8 +368,7 @@ impl Task {
             id,
             parent_task_id,
             state: TaskState::Runnable,
-            continuation,
-            yielder,
+            body: TaskBody::Continuation { inner, yielder },
             clock,
             waiter: None,
             waker,
@@ -438,6 +460,93 @@ impl Task {
             parent_task_id,
             signature,
         )
+    }
+
+    /// Spawn a poll-mode async task. The future is stored directly and polled from the execution
+    /// loop without a coroutine wrapper. This avoids coroutine overhead but means sync primitives
+    /// cannot cause context switches within a poll — any blocking call will panic.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_future_poll<F>(
+        future: F,
+        id: TaskId,
+        name: Option<String>,
+        clock: VectorClock,
+        parent_span_id: Option<tracing::span::Id>,
+        schedule_len: usize,
+        tag: Option<Arc<dyn Tag>>,
+        parent_task_id: Option<TaskId>,
+        signature: TaskSignature,
+    ) -> Self
+    where
+        F: Future<Output = ()> + 'static,
+    {
+        #[cfg(all(any(test, feature = "vector-clocks"), not(feature = "bench-no-vector-clocks")))]
+        assert!(id.0 < clock.time.len());
+
+        let waker = make_waker(id);
+        let future_body = Rc::new(RefCell::new(Box::pin(future) as Pin<Box<dyn Future<Output = ()>>>));
+
+        let step_span = error_span!(parent: parent_span_id.clone(), "step", task = format!("{:?}", id), i = field::Empty);
+        let span_stack = vec![step_span.clone()];
+
+        let mut task = Self {
+            id,
+            parent_task_id,
+            state: TaskState::Runnable,
+            body: TaskBody::Future(future_body),
+            clock,
+            waiter: None,
+            waker,
+            woken: false,
+            detached: false,
+            park_state: ParkState::default(),
+            name,
+            step_span,
+            span_stack,
+            local_storage: StorageMap::new(),
+            tag: None,
+            backtrace: None,
+            signature,
+        };
+
+        if let Some(tag) = tag {
+            task.set_tag(tag);
+        }
+
+        error_span!(parent: parent_span_id, "new_task", parent = ?parent_task_id, i = schedule_len).in_scope(
+            || event!(Level::DEBUG, task_id = ?task.id, signature = task.signature.signature_hash(), static_create_location = task.signature.static_create_location_hash(), "created task"),
+        );
+
+        task
+    }
+
+    /// Returns whether this task runs in poll mode (no coroutine, no preemption).
+    pub(crate) fn is_poll_mode(&self) -> bool {
+        matches!(self.body, TaskBody::Future(_))
+    }
+
+    /// Returns an `Rc` clone of the continuation, panicking if this is a poll-mode task.
+    pub(crate) fn continuation_rc(&self) -> Rc<RefCell<PooledContinuation>> {
+        match &self.body {
+            TaskBody::Continuation { inner, .. } => inner.clone(),
+            TaskBody::Future(_) => panic!("poll-mode task has no continuation"),
+        }
+    }
+
+    /// Returns the raw yielder pointer, panicking if this is a poll-mode task.
+    pub(crate) fn raw_yielder(&self) -> *const Yielder<ContinuationInput, ContinuationOutput> {
+        match &self.body {
+            TaskBody::Continuation { yielder, .. } => *yielder,
+            TaskBody::Future(_) => panic!("poll-mode task has no yielder"),
+        }
+    }
+
+    /// Returns an `Rc` clone of the future if this is a poll-mode task, or `None` for coroutine tasks.
+    pub(crate) fn poll_future_rc(&self) -> Option<Rc<RefCell<Pin<Box<dyn Future<Output = ()>>>>>> {
+        match &self.body {
+            TaskBody::Future(fut) => Some(fut.clone()),
+            TaskBody::Continuation { .. } => None,
+        }
     }
 
     /// Returns the identifier of this task.

@@ -119,18 +119,19 @@ fn async_thread_yield() {
 #[should_panic(expected = "DFS should find a schedule where r=1 here")]
 fn async_atomic() {
     // This tests if shuttle can correctly schedule a different task
-    // after thread::yield_now is called from within an async block
+    // after thread::yield_now is called from within an async block.
+    // Uses spawn_preemptive so that thread::yield_now() triggers a context switch.
     use std::sync::atomic::{AtomicUsize, Ordering};
     check_dfs(
         || {
             let r = Arc::new(AtomicUsize::new(0));
             let r1 = r.clone();
-            future::spawn(async move {
+            future::spawn_preemptive(async move {
                 r1.store(1, Ordering::SeqCst);
                 thread::yield_now();
                 r1.store(0, Ordering::SeqCst);
             });
-            future::spawn(async move {
+            future::spawn_preemptive(async move {
                 assert_eq!(r.load(Ordering::SeqCst), 0, "DFS should find a schedule where r=1 here");
             });
         },
@@ -182,10 +183,12 @@ fn async_yield() {
 
 #[test]
 fn join_handle_abort() {
+    // Uses spawn_preemptive because Barrier::wait() is a blocking sync primitive that requires
+    // coroutine-based context switching.
     check_dfs(
         || {
             let counter = Arc::new(AtomicUsize::new(0));
-            let t1 = future::spawn({
+            let t1 = future::spawn_preemptive({
                 let counter = Arc::clone(&counter);
                 async move {
                     Barrier::new(2).wait();
@@ -363,10 +366,12 @@ fn wake_self_on_join_handle() {
 
 #[test]
 fn is_finished_on_join_handle() {
+    // Uses spawn_preemptive because Barrier::wait() is a blocking sync primitive that requires
+    // coroutine-based context switching.
     check_dfs(
         || {
             let barrier = Arc::new(Barrier::new(2));
-            let t1 = future::spawn({
+            let t1 = future::spawn_preemptive({
                 let barrier = Arc::clone(&barrier);
                 async move {
                     barrier.wait();
@@ -374,7 +379,7 @@ fn is_finished_on_join_handle() {
             });
             assert!(!t1.is_finished());
 
-            future::block_on(future::spawn(async move {
+            future::block_on(future::spawn_preemptive(async move {
                 assert!(!t1.is_finished());
                 barrier.wait();
                 futures::pin_mut!(t1);

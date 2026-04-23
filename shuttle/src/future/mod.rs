@@ -19,37 +19,60 @@ use std::task::{Context, Poll, Waker};
 
 pub mod batch_semaphore;
 
-fn spawn_inner<F>(fut: F, caller: &'static Location<'static>) -> JoinHandle<F::Output>
+fn spawn_inner<F>(fut: F, preemptive: bool, caller: &'static Location<'static>) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
     F::Output: 'static,
 {
     let stack_size = ExecutionState::with(|s| s.config.stack_size);
     let inner = Arc::new(std::sync::Mutex::new(JoinHandleInner::default()));
-    let task_id = ExecutionState::spawn_future(Wrapper::new(fut, inner.clone()), stack_size, None, caller);
+    let task_id = ExecutionState::spawn_future(Wrapper::new(fut, inner.clone()), stack_size, None, caller, preemptive);
 
     JoinHandle { task_id, inner }
 }
 
 /// Spawn a new async task that the executor will run to completion.
+///
+/// The task runs in **poll mode**: the future is driven directly by the execution loop without a
+/// coroutine wrapper. This avoids coroutine allocation overhead. Context switches do not occur
+/// within a single poll, so sync primitives used inside the task must not block (e.g., an
+/// uncontested `Mutex::lock` is fine; a `Barrier::wait` that must block is not). Use
+/// [`spawn_preemptive`] if the task needs blocking sync primitives or finer-grained preemption.
 #[track_caller]
 pub fn spawn<F>(fut: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    spawn_inner(fut, Location::caller())
+    spawn_inner(fut, false, Location::caller())
 }
 
 /// Spawn a new async task that the executor will run to completion.
 /// This is just `spawn` without the `Send` bound, and it mirrors `spawn_local` from Tokio.
+///
+/// Like [`spawn`], this runs in poll mode. See [`spawn`] for details.
 #[track_caller]
 pub fn spawn_local<F>(fut: F) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
     F::Output: 'static,
 {
-    spawn_inner(fut, Location::caller())
+    spawn_inner(fut, false, Location::caller())
+}
+
+/// Spawn a new async task using a coroutine (preemptive mode).
+///
+/// Unlike [`spawn`], this wraps the future in a coroutine so that the scheduler can context-switch
+/// at every sync primitive boundary. Use this when the task uses blocking sync primitives
+/// (e.g., `Barrier::wait`, `Mutex::lock` under contention) or when you want the maximum number
+/// of scheduling interleavings to be explored.
+#[track_caller]
+pub fn spawn_preemptive<F>(fut: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    spawn_inner(fut, true, Location::caller())
 }
 
 /// An owned permission to abort a spawned task, without awaiting its completion.

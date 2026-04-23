@@ -331,8 +331,25 @@ unsafe impl Send for PooledContinuation {}
 pub(crate) fn switch() {
     crate::annotations::record_tick();
     trace!("switch from {}", Location::caller());
+
+    if ExecutionState::current_is_poll_mode() {
+        // In poll-mode tasks the execution loop drives scheduling between polls, so we cannot
+        // context-switch within a single poll. Any sync primitive that blocks the task (setting
+        // its state to Blocked or Sleeping) will deadlock if we simply return here, so we detect
+        // that and panic with a helpful message instead.
+        ExecutionState::with(|state| {
+            let current = state.current();
+            assert!(
+                !current.sleeping() && !current.blocked(),
+                "a blocking sync primitive was called from a poll-mode async task; \
+                 use the async API (.await) or spawn the task with `shuttle::future::spawn_preemptive`"
+            );
+        });
+        return;
+    }
+
     if ExecutionState::maybe_yield() {
-        let yielder = ExecutionState::with(|state| state.current().yielder);
+        let yielder = ExecutionState::with(|state| state.current().raw_yielder());
 
         // SAFETY: A yielder reference will be valid for the lifetime of the continuation (see `corosensei::Coroutine::with_stack`)
         // The yielder field is stored on the Task, whose lifetime is necessarily subsumed by the lifetime of the continuation which contains it.
