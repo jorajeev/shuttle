@@ -14,6 +14,7 @@ use std::future::Future;
 use std::panic::Location;
 use std::pin::Pin;
 use std::result::Result;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
@@ -26,9 +27,15 @@ where
 {
     let stack_size = ExecutionState::with(|s| s.config.stack_size);
     let inner = Arc::new(std::sync::Mutex::new(JoinHandleInner::default()));
-    let task_id = ExecutionState::spawn_future(Wrapper::new(fut, inner.clone()), stack_size, None, caller);
+    let aborted = Arc::new(AtomicBool::new(false));
+    let task_id = ExecutionState::spawn_future(
+        Wrapper::new(fut, inner.clone(), aborted.clone()),
+        stack_size,
+        None,
+        caller,
+    );
 
-    JoinHandle { task_id, inner }
+    JoinHandle { task_id, inner, aborted }
 }
 
 /// Spawn a new async task that the executor will run to completion.
@@ -56,11 +63,15 @@ where
 #[derive(Debug, Clone)]
 pub struct AbortHandle {
     task_id: TaskId,
+    aborted: Arc<AtomicBool>,
 }
 
 impl AbortHandle {
     /// Abort the task associated with the handle.
     pub fn abort(&self) {
+        // Signal the Wrapper to skip the inner future on the next poll.
+        self.aborted.store(true, Ordering::Release);
+        // Wake the task so Wrapper::poll() runs and performs cleanup.
         let res = ExecutionState::try_with(|state| {
             if !state.is_finished() {
                 state.get_mut(self.task_id).abort();
@@ -74,7 +85,7 @@ impl AbortHandle {
     /// Returns `true` if this task is finished, otherwise returns `false`.
     ///
     /// ## Panics
-    /// Panics if called outside of shuttle context, i.e. if there is no execution context.
+    /// Panics if called outside of a Shuttle context, i.e. if there is no execution context.
     pub fn is_finished(&self) -> bool {
         ExecutionState::with(|state| {
             let task = state.get(self.task_id);
@@ -90,7 +101,8 @@ unsafe impl Sync for AbortHandle {}
 #[derive(Debug)]
 pub struct JoinHandle<T> {
     task_id: TaskId,
-    inner: std::sync::Arc<std::sync::Mutex<JoinHandleInner<T>>>,
+    inner: Arc<std::sync::Mutex<JoinHandleInner<T>>>,
+    aborted: Arc<AtomicBool>,
 }
 
 #[derive(Debug)]
@@ -110,7 +122,13 @@ impl<T> Default for JoinHandleInner<T> {
 
 impl<T> JoinHandle<T> {
     /// Abort the task associated with the handle.
+    ///
+    /// The task will be cancelled at the next await point. Awaiting the `JoinHandle` after
+    /// calling `abort` will return `Err(JoinError::Cancelled)`.
     pub fn abort(&self) {
+        // Signal the Wrapper to skip the inner future on the next poll.
+        self.aborted.store(true, Ordering::Release);
+        // Wake the task so Wrapper::poll() runs and performs cleanup.
         let res = ExecutionState::try_with(|state| {
             if !state.is_finished() {
                 state.get_mut(self.task_id).abort();
@@ -124,7 +142,7 @@ impl<T> JoinHandle<T> {
     /// Returns `true` if this task is finished, otherwise returns `false`.
     ///
     /// ## Panics
-    /// Panics if called outside of shuttle context, i.e. if there is no execution context.
+    /// Panics if called outside of a Shuttle context, i.e. if there is no execution context.
     pub fn is_finished(&self) -> bool {
         ExecutionState::with(|state| {
             let task = state.get(self.task_id);
@@ -134,7 +152,10 @@ impl<T> JoinHandle<T> {
 
     /// Returns a new `AbortHandle` that can be used to remotely abort this task.
     pub fn abort_handle(&self) -> AbortHandle {
-        AbortHandle { task_id: self.task_id }
+        AbortHandle {
+            task_id: self.task_id,
+            aborted: self.aborted.clone(),
+        }
     }
 }
 
@@ -158,7 +179,16 @@ impl Error for JoinError {}
 
 impl<T> Drop for JoinHandle<T> {
     fn drop(&mut self) {
-        self.abort();
+        // Detach the task so it keeps running but we don't wait for it.
+        // Dropping a JoinHandle does NOT cancel the task (unlike abort()).
+        let res = ExecutionState::try_with(|state| {
+            if !state.is_finished() {
+                state.get_mut(self.task_id).detach();
+            }
+        });
+        if let Err(e) = res {
+            tracing::error!("`JoinHandle::drop` failed with error: {e:?}");
+        }
     }
 }
 
@@ -180,9 +210,16 @@ impl<T> Future for JoinHandle<T> {
 // contains a mutex-wrapped field that stores the value and the waker for the task
 // waiting on the join handle. When `poll` returns `Poll::Ready`, the `Wrapper` stores
 // the result in the `result` field and wakes the `waker`.
+//
+// The `aborted` flag is set by `JoinHandle::abort()` / `AbortHandle::abort()`. On the
+// next poll, `Wrapper` detects the flag, publishes `Err(JoinError::Cancelled)` to any
+// awaiting join handle, and returns `Poll::Ready(())`. The inner future is then dropped
+// when the executor's `Box::pin(Wrapper)` goes out of scope, running its destructors
+// cleanly at a well-defined point (after the cancelled task's continuation returns).
 struct Wrapper<F: Future> {
     future: Pin<Box<F>>,
-    inner: std::sync::Arc<std::sync::Mutex<JoinHandleInner<F::Output>>>,
+    inner: Arc<std::sync::Mutex<JoinHandleInner<F::Output>>>,
+    aborted: Arc<AtomicBool>,
 }
 
 impl<F> Wrapper<F>
@@ -190,10 +227,15 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
-    fn new(future: F, inner: std::sync::Arc<std::sync::Mutex<JoinHandleInner<F::Output>>>) -> Self {
+    fn new(
+        future: F,
+        inner: Arc<std::sync::Mutex<JoinHandleInner<F::Output>>>,
+        aborted: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             future: Box::pin(future),
             inner,
+            aborted,
         }
     }
 }
@@ -206,6 +248,30 @@ where
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Cancellation check: if abort() was called, skip polling the inner future.
+        // The inner future is dropped (with its destructors running) when the Wrapper
+        // itself is dropped after this poll returns Poll::Ready(()).
+        if self.aborted.load(Ordering::Acquire) {
+            // Mirror the early-exit guard used in the normal completion path below.
+            if ExecutionState::try_with(|state| state.is_finished()).unwrap_or(true) {
+                return Poll::Ready(());
+            }
+
+            // Run thread-local destructors before publishing the cancelled result,
+            // mirroring the normal completion path.
+            while let Some(local) = ExecutionState::with(|state| state.current_mut().pop_local()) {
+                drop(local);
+            }
+
+            let mut lock = self.inner.lock().unwrap();
+            lock.result = Some(Err(JoinError::Cancelled));
+            if let Some(waker) = lock.waker.take() {
+                waker.wake();
+            }
+
+            return Poll::Ready(());
+        }
+
         match self.future.as_mut().poll(cx) {
             Poll::Ready(result) => {
                 // If we've finished execution already (this task was detached), don't clean up. We

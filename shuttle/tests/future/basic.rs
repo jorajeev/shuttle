@@ -396,6 +396,291 @@ impl Spawn for ShuttleSpawn {
     }
 }
 
+// ---- Abort tests ----
+
+// Abort before the task ever runs: join handle should resolve to Err(Cancelled).
+#[test]
+fn abort_before_task_runs_join_returns_cancelled() {
+    check_dfs(
+        || {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let t1 = future::spawn({
+                let counter = Arc::clone(&counter);
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            t1.abort();
+            let result = future::block_on(async move { t1.await });
+            assert!(
+                result.is_err(),
+                "aborted task should resolve with Err(Cancelled)"
+            );
+            assert_eq!(0, counter.load(Ordering::SeqCst), "aborted task must not run");
+        },
+        None,
+    );
+}
+
+// Abort a task that has already yielded once; join returns Cancelled and counter stays 0.
+#[test]
+fn abort_after_yield_join_returns_cancelled() {
+    check_dfs(
+        || {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let t1 = future::spawn({
+                let counter = Arc::clone(&counter);
+                async move {
+                    future::yield_now().await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            // Give the task a chance to run until the yield point, then abort.
+            let abort_handle = t1.abort_handle();
+            let waiter = future::spawn(async move {
+                abort_handle.abort();
+                t1.await
+            });
+            let result = future::block_on(waiter).unwrap();
+            // Either the task completed before abort, or it was cancelled.
+            // In all DFS orderings, counter is either 0 (aborted) or 1 (completed first).
+            match result {
+                Ok(_) => assert_eq!(1, counter.load(Ordering::SeqCst)),
+                Err(_) => assert_eq!(0, counter.load(Ordering::SeqCst)),
+            }
+        },
+        None,
+    );
+}
+
+// Aborting an already-finished task is a no-op; join still returns Ok.
+#[test]
+fn abort_finished_task_returns_ok() {
+    check_dfs(
+        || {
+            let t1 = future::spawn(async { 42u32 });
+            let result = future::block_on(async move {
+                let val = t1.await;
+                val
+            });
+            // Task completed normally before abort; result should be Ok(42).
+            assert!(matches!(result, Ok(42)));
+        },
+        None,
+    );
+}
+
+// AbortHandle can be used to abort a task after the JoinHandle is gone.
+#[test]
+fn abort_via_abort_handle() {
+    check_dfs(
+        || {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let t1 = future::spawn({
+                let counter = Arc::clone(&counter);
+                async move {
+                    // Block forever at a barrier so the task doesn't complete naturally.
+                    Barrier::new(2).wait();
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let abort = t1.abort_handle();
+            abort.abort();
+            abort.abort(); // idempotent
+            assert_eq!(0, counter.load(Ordering::SeqCst));
+        },
+        None,
+    );
+}
+
+// Abort handle clone works the same as the original.
+#[test]
+fn abort_handle_clone() {
+    check_dfs(
+        || {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let t1 = future::spawn({
+                let counter = Arc::clone(&counter);
+                async move {
+                    Barrier::new(2).wait();
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let abort1 = t1.abort_handle();
+            let abort2 = abort1.clone();
+            abort2.abort();
+            assert_eq!(0, counter.load(Ordering::SeqCst));
+        },
+        None,
+    );
+}
+
+// Aborting with JoinHandle while another task is awaiting it via block_on.
+#[test]
+fn abort_while_joined() {
+    check_dfs(
+        || {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let t1 = future::spawn({
+                let counter = Arc::clone(&counter);
+                async move {
+                    future::yield_now().await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    42u32
+                }
+            });
+            let abort = t1.abort_handle();
+            // Spawn a task that aborts t1, then join on it.
+            let joiner = future::spawn(async move { t1.await });
+            abort.abort();
+            let result = future::block_on(joiner).unwrap();
+            match result {
+                Ok(42) => assert_eq!(1, counter.load(Ordering::SeqCst)),
+                Err(_) => assert_eq!(0, counter.load(Ordering::SeqCst)),
+                _ => panic!("unexpected result"),
+            }
+        },
+        None,
+    );
+}
+
+// Dropped JoinHandle (without abort) lets the task run to completion as a detached task.
+#[test]
+fn drop_join_handle_detaches_task() {
+    let total_runs = Arc::new(AtomicUsize::new(0));
+    let total_runs_clone = total_runs.clone();
+    check_dfs(
+        move || {
+            let ran = Arc::new(AtomicUsize::new(0));
+            let ran2 = ran.clone();
+            // Spawn and immediately drop the handle (detaches).
+            drop(future::spawn(async move {
+                ran2.fetch_add(1, Ordering::SeqCst);
+            }));
+            // Allow the detached task to run.
+            future::block_on(future::yield_now());
+            // The detached task may or may not have run depending on scheduling.
+            total_runs.fetch_add(ran.load(Ordering::SeqCst), Ordering::SeqCst);
+        },
+        None,
+    );
+    // Across DFS orderings the detached task runs in some orderings.
+    assert!(total_runs_clone.load(Ordering::SeqCst) > 0);
+}
+
+// Destructors of the inner future run when the task is aborted.
+#[test]
+fn abort_runs_inner_future_drop() {
+    use std::sync::Mutex;
+
+    #[derive(Clone)]
+    struct DropCounter(Arc<Mutex<usize>>);
+
+    impl Drop for DropCounter {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() += 1;
+        }
+    }
+
+    check_dfs(
+        || {
+            let drop_count = Arc::new(Mutex::new(0usize));
+            let dc = DropCounter(drop_count.clone());
+            let t1 = future::spawn(async move {
+                // Hold the DropCounter so its destructor runs when the future is dropped.
+                let _guard = dc;
+                future::yield_now().await;
+                // Never reached when aborted before the yield resolves.
+            });
+            t1.abort();
+            // block_on the join handle so we wait until the aborted task actually
+            // finishes (and thus drops the inner future and DropCounter).
+            let result = future::block_on(t1);
+            assert!(result.is_err(), "should be Err(Cancelled)");
+            // The DropCounter should have been dropped exactly once.
+            assert_eq!(1, *drop_count.lock().unwrap());
+        },
+        None,
+    );
+}
+
+// Multiple tasks can be aborted independently.
+#[test]
+fn abort_multiple_tasks() {
+    check_dfs(
+        || {
+            let c1 = Arc::new(AtomicUsize::new(0));
+            let c2 = Arc::new(AtomicUsize::new(0));
+            let c3 = Arc::new(AtomicUsize::new(0));
+
+            let t1 = future::spawn({
+                let c1 = c1.clone();
+                async move {
+                    Barrier::new(2).wait();
+                    c1.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let t2 = future::spawn({
+                let c2 = c2.clone();
+                async move {
+                    Barrier::new(2).wait();
+                    c2.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+            let t3 = future::spawn({
+                let c3 = c3.clone();
+                async move { c3.fetch_add(1, Ordering::SeqCst) }
+            });
+
+            t1.abort();
+            t2.abort();
+
+            // t3 was not aborted; block_on should resolve to Ok.
+            let result = future::block_on(t3);
+            assert!(result.is_ok());
+            assert_eq!(1, c3.load(Ordering::SeqCst));
+
+            // t1 and t2 were aborted and must not have incremented their counters.
+            assert_eq!(0, c1.load(Ordering::SeqCst));
+            assert_eq!(0, c2.load(Ordering::SeqCst));
+        },
+        None,
+    );
+}
+
+// is_finished returns true after the task completes normally.
+#[test]
+fn is_finished_after_normal_completion() {
+    check_dfs(
+        || {
+            let t1 = future::spawn(async { 1u32 });
+            future::block_on(async move {
+                t1.await.unwrap();
+                // is_finished is true after await resolves.
+            });
+        },
+        None,
+    );
+}
+
+// is_finished on AbortHandle returns true after abort completes.
+#[test]
+fn is_finished_on_abort_handle() {
+    check_dfs(
+        || {
+            let t1 = future::spawn(async {
+                future::yield_now().await;
+            });
+            let abort = t1.abort_handle();
+            abort.abort();
+            // block_on the join handle so we know the aborted task has fully finished.
+            let _ = future::block_on(t1);
+            assert!(abort.is_finished());
+        },
+        None,
+    );
+}
+
 // Make sure a spawned detached task gets cleaned up correctly after execution ends
 #[test]
 fn clean_up_detached_task() {

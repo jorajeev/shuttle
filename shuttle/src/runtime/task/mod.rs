@@ -482,8 +482,19 @@ impl Task {
     }
 
     pub(crate) fn abort(&mut self) {
-        // TODO: Change into actually aborting
+        if self.finished() {
+            return;
+        }
         self.detach();
+        // Set woken so the task doesn't immediately re-sleep when Wrapper::poll() is next called.
+        self.woken = true;
+        // If the task is sleeping at an async await point, make it runnable so
+        // Wrapper::poll() gets to check the abort flag and do cleanup.
+        if self.sleeping() {
+            self.state = TaskState::Runnable;
+        }
+        // Runnable tasks already get polled; Blocked tasks (sync primitives) will
+        // detect the abort flag naturally when they next reach Wrapper::poll().
     }
 
     pub(crate) fn waker(&self) -> Waker {
