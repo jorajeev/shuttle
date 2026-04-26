@@ -32,6 +32,7 @@ The stable foundation everything else builds on. Contains:
 - `Task`, `TaskId`, `TaskState`, `TaskSet`
 - `VectorClock` (feature-gated — see below)
 - `DependencyGraph` (always-on — see below)
+- `ExecutionTrace`, `TraceEvent` (for post-execution DPOR — see below)
 - `ResourceSignature`, `ResourceType` (cross-iteration resource identity)
 - `Labels`, `ChildLabelFn`, `TaskName`
 - `Schedule`, `ScheduleStep`, schedule serialization
@@ -95,9 +96,18 @@ pub trait Scheduler {
     fn next_u64(&mut self) -> u64;
 
     /// Called at the end of each execution. Default no-op.
-    /// Allows schedulers to observe runtime metrics without forcing
-    /// all implementations to handle it.
-    fn on_execution_complete(&mut self, _metrics: &ExecutionMetrics) {}
+    /// Receives both runtime metrics and the full execution trace.
+    /// DPOR schedulers use the trace to compute backtracking sets;
+    /// metrics schedulers use only the metrics and ignore the trace.
+    fn on_execution_complete(&mut self, _metrics: &ExecutionMetrics, _trace: &ExecutionTrace) {}
+
+    /// Incremental task-state hooks. Default no-ops.
+    /// Schedulers that maintain their own sorted structures (e.g. a
+    /// priority heap) implement these to update incrementally rather
+    /// than scanning `runnable_tasks` on every `next_task` call.
+    fn on_task_runnable(&mut self, _task: &TaskView) {}
+    fn on_task_blocked(&mut self, _task_id: TaskId) {}
+    fn on_task_finished(&mut self, _task_id: TaskId) {}
 }
 ```
 
@@ -121,12 +131,12 @@ pub struct TaskView<'a> {
 
 This single change unblocks all five features:
 
-| Feature | How `ExecutionContext` enables it |
+| Feature | Mechanism |
 |---|---|
-| Metrics | `on_execution_complete` hook + `ExecutionMetrics` from the runtime |
-| Constraint hints | `TaskView::labels` — scheduler reads user-set weights/priorities |
-| DPOR / execution graphs | `dependency_graph` always present |
-| Causal debugging | `TaskView::clock` when feature is on; dependency graph always |
+| Metrics | `on_execution_complete` + `ExecutionMetrics` |
+| Constraint hints | `TaskView::labels` in `ExecutionContext`; incremental hooks for priority heaps |
+| DPOR / execution graphs | `DependencyGraph` in `ExecutionContext` (online variants); `ExecutionTrace` in `on_execution_complete` (offline variants) |
+| Causal debugging | `TaskView::clock` when feature is on; `ExecutionTrace` always |
 | Better panic handling | Orthogonal — addressed in `shuttle-core::failure` |
 
 ---
@@ -180,8 +190,8 @@ new design:
 
 - The `Execution` engine populates an `ExecutionMetrics` struct per execution:
   - context switches, task count, steps taken, wall time, stack memory allocated
-- `on_execution_complete(&mut self, metrics: &ExecutionMetrics)` is called on the
-  scheduler at the end of each execution
+- `on_execution_complete(&mut self, metrics: &ExecutionMetrics, trace: &ExecutionTrace)`
+  is called on the scheduler at the end of each execution
 - `MetricsScheduler` implements this hook to aggregate across executions
 - Users implementing custom schedulers can opt in by overriding the default no-op
 
@@ -207,19 +217,81 @@ The `ConstraintScheduler` implementation lives in `shuttle-schedulers`.
 
 ### 3. Execution graphs and DPOR
 
-The `DependencyGraph` in `ExecutionContext` gives a DPOR scheduler everything it needs:
+**The shape of the `Scheduler` trait does not need to change for DPOR.** DPOR is a
+smarter implementation of the existing interface: `new_execution()` returns the next
+backtracking schedule, `next_task()` replays the prefix then diverges, and
+`new_execution() -> None` signals exhaustion. The additions are purely in what data
+the scheduler can observe.
 
-- At each step, which tasks' past operations are dependent on the current candidate?
-- If task B's next operation is dependent on a recent operation of task A, and there
-  exists an alternative execution where B runs before A, the DPOR scheduler must
-  explore that alternative.
+#### Execution graph model (from Must, OOPSLA 2024)
 
-The classic DPOR backtracking set computation runs entirely within the scheduler using
-the dependency graph — no changes to the execution engine are needed beyond populating
-`AccessRecord`s.
+Must builds an execution graph incrementally during forward exploration. In Shuttle's
+setting the graph has:
 
-Optimal DPOR (Source-DPOR, Ideal-DPOR) variants that additionally use vector clocks
-can use `TaskView::clock` when the `vector-clocks` feature is enabled.
+- **Nodes** — events (scheduling points / sync operations)
+- **`po` edges** — program order within a task (always present)
+- **`rf` edges** — "reads-from" / communication: which earlier event a receive/acquire
+  reads from
+- **`hb`** — transitive closure of `po ∪ rf`; the happens-before relation
+
+Two events are **dependent** iff they access the same resource with conflicting access
+types (e.g., two lock acquisitions on the same mutex, a send and a receive on the same
+channel). The DPOR algorithm finds pairs `(e1, e2)` that are dependent but unordered
+by `hb` and queues alternative schedules that explore the other ordering.
+
+Shuttle's dependency relation is simpler than the general memory-model case because
+all concurrency goes through explicit synchronization primitives — there are no
+uncontrolled memory reads/writes to track. Every event already carries a
+`ResourceSignature`, so dependency detection reduces to: same signature, conflicting
+`AccessType`.
+
+#### Two mechanisms for different DPOR variants
+
+**Online variants** (Source-DPOR, Optimal-DPOR with wakeup trees) compute backtracking
+sets *during* forward execution. At each `next_task` call, the scheduler inspects the
+`DependencyGraph` in `ExecutionContext` to ask: "for each candidate task, are there
+past events dependent on it that are not in its `hb` cone?" If so, a backtracking
+point is recorded immediately. These variants need no post-execution hook beyond what
+`ExecutionContext` already provides.
+
+**Offline variants** (Must-style) complete a full execution first and then compute the
+revisit set from the entire execution graph. These use the `ExecutionTrace` passed to
+`on_execution_complete`:
+
+```rust
+pub struct ExecutionTrace {
+    pub events: Vec<TraceEvent>,
+}
+
+pub struct TraceEvent {
+    pub step: usize,
+    pub task: TaskId,
+    pub resource: ResourceSignature,
+    pub access: AccessType,
+    /// Indices into `events` giving the happens-before frontier at this point.
+    pub hb_predecessors: Vec<usize>,
+}
+```
+
+The DPOR scheduler reads the completed trace, identifies dependent unordered pairs,
+generates modified `Schedule`s that replay up to each backtracking point and then
+diverge, and queues them to be returned by future `new_execution()` calls.
+
+#### Lazy dependency tracking
+
+Must includes an optimization: track ordering among events lazily, only recording an
+`hb` edge between two events when they are actually dependent. Many operations commute
+(two tasks sending on different channels have no dependency), so no edge is needed.
+In Shuttle this falls out naturally from `ResourceSignature` — the engine only creates
+a `hb` edge between events that share a resource signature. Events on different
+resources never generate edges, keeping the graph sparse.
+
+#### What the engine provides, what the scheduler owns
+
+The engine tracks what happened (`AccessRecord`s → `DependencyGraph` → `ExecutionTrace`).
+The scheduler decides what to explore next (backtracking sets → `Schedule` queue).
+The `DporScheduler` implementation lives entirely in `shuttle-schedulers` — no DPOR
+logic enters the engine.
 
 ### 4. Causal debugging and trace minimization
 
@@ -326,17 +398,20 @@ impl<S: LegacyScheduler + ...> Scheduler for LegacyAdapter<S> { ... }
 Incremental approach — validate each step before cutting the crate boundary:
 
 1. **Define new types** — `ExecutionContext`, `TaskView`, `DependencyGraph`,
-   `AccessRecord`, `ExecutionMetrics` — in the current `shuttle` crate. No behavior
-   change, just types.
+   `AccessRecord`, `ExecutionMetrics`, `ExecutionTrace`, `TraceEvent` — in the current
+   `shuttle` crate. No behavior change, just types.
 
 2. **Migrate `Scheduler::next_task`** to take `&ExecutionContext`. Update all
    built-in schedulers. Add `LegacyAdapter`. This is the riskiest step and benefits
    from being done first while there is only one crate to update.
 
 3. **Wire up `AccessRecord` collection** in the execution engine. Populate
-   `DependencyGraph` per execution. No scheduler behavior changes yet.
+   `DependencyGraph` and `ExecutionTrace` per execution. No scheduler behavior changes
+   yet.
 
-4. **Add `on_execution_complete` hook** and migrate `MetricsScheduler` to use it.
+4. **Add `on_execution_complete` and incremental hooks** (`on_task_runnable`,
+   `on_task_blocked`, `on_task_finished`). Migrate `MetricsScheduler` to use
+   `on_execution_complete`.
 
 5. **Factor `ExecutionState`** into a clean internal API: define what surface area
    `shuttle-sync` needs to call, make that surface explicit and stable.
