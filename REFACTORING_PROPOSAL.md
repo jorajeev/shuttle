@@ -32,7 +32,7 @@ The stable foundation everything else builds on. Contains:
 - `Task`, `TaskId`, `TaskState`, `TaskSet`
 - `VectorClock` (feature-gated — see below)
 - `DependencyGraph` (always-on — see below)
-- `ExecutionTrace`, `TraceEvent` (for post-execution DPOR — see below)
+- `ExecutionTrace`, `TraceEvent` (incrementally built by the runtime — see below)
 - `ResourceSignature`, `ResourceType` (cross-iteration resource identity)
 - `Labels`, `ChildLabelFn`, `TaskName`
 - `Schedule`, `ScheduleStep`, schedule serialization
@@ -148,25 +148,47 @@ These are two separate concerns that the current implementation conflates under 
 
 ### Resource dependency tracking (always-on)
 
-At each scheduling point, every sync primitive reports which resource it is accessing
-and how. This produces a record:
+The execution graph has two kinds of edges:
+
+- **`po` edges** — program order within a task. Trivially maintained as a per-task
+  step counter; zero extra cost.
+- **`rf` edges** — "reads-from": which release event directly enabled a given acquire.
+
+The key insight is that **`rf` edges are free**: the runtime already knows at the
+moment a blocked task is unblocked exactly which release event caused it. This
+information is implicit in the existing `BatchSemaphore` / task scheduling logic —
+surfacing it as an annotated field on `TraceEvent` costs nothing extra.
 
 ```rust
-pub struct AccessRecord {
+pub struct TraceEvent {
     pub step: usize,
     pub task: TaskId,
     pub resource: ResourceSignature,
-    pub access: AccessType,  // Read, Write, Acquire, Release, ...
+    pub access: AccessType,  // Acquire, Release, Read, Write, ...
+    /// The release event that directly enabled this acquire, if any.
+    /// Emitted free by the runtime at the moment of unblocking.
+    pub rf_predecessor: Option<usize>,  // index into ExecutionTrace::events
 }
 ```
 
-Two operations are **dependent** iff they access the same resource with conflicting
-access types (e.g., two lock acquisitions on the same mutex). The `DependencyGraph`
-is built from these records.
+Two events are **dependent** iff they carry the same `ResourceSignature` with
+conflicting `AccessType`s. The `DependencyGraph` is the `po ∪ rf` graph built
+from these events. The `hb` relation is its transitive closure, computed lazily
+by the DPOR scheduler only when needed — the engine does not precompute it.
 
-Overhead: `O(1)` per scheduling point, `O(steps)` total per execution. Always enabled.
+Overhead comparison:
+
+| Approach | Per step | Per execution (DPOR query) |
+|---|---|---|
+| Naive post-hoc | O(1) record | O(steps²) pair scan |
+| Runtime-assisted | O(1) record + O(1) `rf` annotation at unblock | O(steps) graph traversal |
+
+The `DependencyGraph` in `ExecutionContext` is the same structure maintained
+incrementally — updated with each new `TraceEvent` as the execution progresses,
+so online DPOR variants pay O(1) per step rather than rebuilding on each call.
+
 `ResourceSignature` already exists in the codebase; this adds only the `AccessType`
-annotation and the graph structure on top.
+annotation and the `rf_predecessor` link emitted at unblock time.
 
 ### Vector clocks (feature-gated, unchanged)
 
@@ -255,43 +277,28 @@ point is recorded immediately. These variants need no post-execution hook beyond
 `ExecutionContext` already provides.
 
 **Offline variants** (Must-style) complete a full execution first and then compute the
-revisit set from the entire execution graph. These use the `ExecutionTrace` passed to
-`on_execution_complete`:
+revisit set from the entire execution graph. By the time `on_execution_complete` fires,
+the `ExecutionTrace` is fully built — `rf` edges were annotated by the runtime at
+unblock time, so no post-hoc O(steps²) scan is needed. The DPOR scheduler reads the
+completed trace, identifies dependent unordered pairs (same `ResourceSignature`,
+conflicting `AccessType`, not connected by `hb`), generates modified `Schedule`s that
+replay up to each backtracking point and then diverge, and queues them for future
+`new_execution()` calls.
 
-```rust
-pub struct ExecutionTrace {
-    pub events: Vec<TraceEvent>,
-}
+#### Lazy graph sparsity
 
-pub struct TraceEvent {
-    pub step: usize,
-    pub task: TaskId,
-    pub resource: ResourceSignature,
-    pub access: AccessType,
-    /// Indices into `events` giving the happens-before frontier at this point.
-    pub hb_predecessors: Vec<usize>,
-}
-```
-
-The DPOR scheduler reads the completed trace, identifies dependent unordered pairs,
-generates modified `Schedule`s that replay up to each backtracking point and then
-diverge, and queues them to be returned by future `new_execution()` calls.
-
-#### Lazy dependency tracking
-
-Must includes an optimization: track ordering among events lazily, only recording an
-`hb` edge between two events when they are actually dependent. Many operations commute
-(two tasks sending on different channels have no dependency), so no edge is needed.
-In Shuttle this falls out naturally from `ResourceSignature` — the engine only creates
-a `hb` edge between events that share a resource signature. Events on different
-resources never generate edges, keeping the graph sparse.
+Many operations commute: two tasks operating on different resources generate no `rf`
+edge between them. The graph stays sparse naturally because `rf` edges only arise at
+unblock points, and unblocking requires shared resource contention. Events on different
+resources never produce edges. This falls out from `ResourceSignature` with no extra
+tracking needed.
 
 #### What the engine provides, what the scheduler owns
 
-The engine tracks what happened (`AccessRecord`s → `DependencyGraph` → `ExecutionTrace`).
-The scheduler decides what to explore next (backtracking sets → `Schedule` queue).
-The `DporScheduler` implementation lives entirely in `shuttle-schedulers` — no DPOR
-logic enters the engine.
+The engine builds the execution graph incrementally (`TraceEvent`s with `rf_predecessor`
+annotations → `DependencyGraph` → `ExecutionTrace`). The scheduler decides what to
+explore next (backtracking sets → `Schedule` queue). The `DporScheduler` implementation
+lives entirely in `shuttle-schedulers` — no DPOR logic enters the engine.
 
 ### 4. Causal debugging and trace minimization
 
@@ -405,9 +412,10 @@ Incremental approach — validate each step before cutting the crate boundary:
    built-in schedulers. Add `LegacyAdapter`. This is the riskiest step and benefits
    from being done first while there is only one crate to update.
 
-3. **Wire up `AccessRecord` collection** in the execution engine. Populate
-   `DependencyGraph` and `ExecutionTrace` per execution. No scheduler behavior changes
-   yet.
+3. **Wire up incremental graph construction** in `BatchSemaphore` / `ExecutionState`:
+   emit `TraceEvent`s with `rf_predecessor` at unblock time, maintain `DependencyGraph`
+   incrementally, and assemble `ExecutionTrace` per execution. No scheduler behavior
+   changes yet.
 
 4. **Add `on_execution_complete` and incremental hooks** (`on_task_runnable`,
    `on_task_blocked`, `on_task_finished`). Migrate `MetricsScheduler` to use
