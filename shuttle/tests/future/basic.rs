@@ -401,6 +401,133 @@ impl Spawn for ShuttleSpawn {
     }
 }
 
+// ---- Poll-mode specific tests ----
+
+// Blocking sync primitives must not be used in poll-mode tasks.
+// We hold a Mutex in the main task so the spawned future always finds it contested,
+// guaranteeing the poll-mode assertion fires on every DFS iteration.
+#[test]
+#[should_panic(expected = "blocking sync primitive was called from a poll-mode async task")]
+fn poll_mode_blocking_panics() {
+    check_dfs(
+        || {
+            let lock = Arc::new(Mutex::new(0u64));
+            let lock2 = lock.clone();
+            // Hold the lock for the entire main-task closure so the spawned future
+            // always finds it contested when polled.
+            let _guard = lock.lock().unwrap();
+            future::spawn(async move {
+                let _ = lock2.lock().unwrap(); // always blocks → assertion fires
+            });
+        },
+        None,
+    );
+}
+
+// spawn_preemptive correctly allows blocking primitives inside an async task.
+#[test]
+fn preemptive_mode_allows_blocking() {
+    check_dfs(
+        || {
+            let barrier = Arc::new(Barrier::new(2));
+            let barrier2 = barrier.clone();
+            future::spawn_preemptive(async move {
+                barrier2.wait();
+            });
+            barrier.wait();
+        },
+        None,
+    );
+}
+
+// DFS with poll-mode tasks finds all orderings at await points.
+// We verify this by checking that both orderings of two tasks are explored.
+// Task B uses yield_now to create a scheduling point where A can run first.
+#[test]
+fn poll_mode_dfs_completeness() {
+    let orderings = Arc::new(AtomicUsize::new(0));
+    let a_before_b = Arc::new(AtomicUsize::new(0));
+    let b_before_a = Arc::new(AtomicUsize::new(0));
+
+    let orderings_clone = orderings.clone();
+    let a_before_b_clone = a_before_b.clone();
+    let b_before_a_clone = b_before_a.clone();
+
+    check_dfs(
+        move || {
+            orderings.fetch_add(1, Ordering::SeqCst);
+            let flag = Arc::new(AtomicUsize::new(0));
+            let flag2 = flag.clone();
+
+            let a_before_b = a_before_b.clone();
+            let b_before_a = b_before_a.clone();
+
+            future::spawn(async move {
+                flag.store(1, Ordering::SeqCst);
+                future::yield_now().await;
+            });
+
+            // yield_now in B gives the DFS a scheduling point where A can run first.
+            future::block_on(async move {
+                future::yield_now().await;
+                let v = flag2.load(Ordering::SeqCst);
+                if v == 0 {
+                    b_before_a.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    a_before_b.fetch_add(1, Ordering::SeqCst);
+                }
+            });
+        },
+        None,
+    );
+
+    assert!(orderings_clone.load(Ordering::SeqCst) >= 2);
+    assert!(a_before_b_clone.load(Ordering::SeqCst) > 0, "should find ordering where A runs first");
+    assert!(b_before_a_clone.load(Ordering::SeqCst) > 0, "should find ordering where B runs first");
+}
+
+// An uncontested Mutex::lock (no other task touches the same lock) works in poll-mode.
+// The mutex is local to the spawned task so it is provably uncontested.
+#[test]
+fn poll_mode_uncontested_mutex() {
+    check_dfs(
+        || {
+            future::spawn(async move {
+                let lock = Arc::new(Mutex::new(0u64));
+                // Acquire and release entirely within one poll (no await while locked).
+                { *lock.lock().unwrap() += 1; }
+                future::yield_now().await;
+                { *lock.lock().unwrap() += 1; }
+                assert_eq!(*lock.lock().unwrap(), 2);
+            });
+        },
+        None,
+    );
+}
+
+// Drop handlers of poll-mode futures that call sync primitives during cleanup
+// must not panic. This exercises the path where a future holds an Acquire and
+// is dropped during execution cleanup.
+#[test]
+fn poll_mode_cleanup_with_semaphore_acquire() {
+    use shuttle::future::batch_semaphore::{BatchSemaphore, Fairness};
+    check_dfs(
+        || {
+            let sem = Arc::new(BatchSemaphore::new(0, Fairness::StrictlyFair));
+            let sem2 = sem.clone();
+            // The spawned task will block waiting on the semaphore. When the
+            // execution ends (main task finishes without releasing), the future
+            // is dropped during cleanup. Its Acquire drop handler calls release,
+            // which must not panic.
+            future::spawn(async move {
+                let _ = sem2.acquire(1).await;
+            });
+            // Main task doesn't release; future is dropped during cleanup.
+        },
+        None,
+    );
+}
+
 // Make sure a spawned detached task gets cleaned up correctly after execution ends
 #[test]
 fn clean_up_detached_task() {
