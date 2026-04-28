@@ -139,7 +139,10 @@ impl Execution {
         F: FnOnce() + Send + 'static,
     {
         #[cfg(feature = "metrics")]
-        crate::metrics::RunMetrics::reset();
+        {
+            let record_task_metrics = config.metrics.as_ref().map_or(false, |m| m.record_task_metrics);
+            crate::metrics::RunMetrics::reset(record_task_metrics);
+        }
 
         let state = RefCell::new(ExecutionState::new(config.clone(), Rc::clone(&self.scheduler)));
 
@@ -540,6 +543,11 @@ impl ExecutionState {
                 TaskSignature::new_parentless(caller),
             );
             state.tasks.push(task);
+            #[cfg(feature = "metrics")]
+            crate::metrics::RunMetrics::register_task(
+                task_id.0,
+                state.tasks[task_id.0].signature.signature_hash(),
+            );
 
             task_id
         });
@@ -587,6 +595,11 @@ impl ExecutionState {
             );
 
             state.tasks.push(task);
+            #[cfg(feature = "metrics")]
+            crate::metrics::RunMetrics::register_task(
+                task_id.0,
+                state.tasks[task_id.0].signature.signature_hash(),
+            );
 
             task_id
         });
@@ -633,6 +646,11 @@ impl ExecutionState {
                 state.current_mut().signature.new_child(caller),
             );
             state.tasks.push(task);
+            #[cfg(feature = "metrics")]
+            crate::metrics::RunMetrics::register_task(
+                task_id.0,
+                state.tasks[task_id.0].signature.signature_hash(),
+            );
 
             task_id
         });
@@ -933,6 +951,18 @@ impl ExecutionState {
             }
             if is_yielding {
                 m.task_yields += 1;
+            }
+            if let Some(ref mut per_task) = m.per_task {
+                for task in task_refs.iter() {
+                    if let Some(tm) = per_task.get_mut(task.id().0) {
+                        tm.times_in_runnable_set += 1;
+                    }
+                }
+                if let ScheduledTask::Some(chosen) = self.next_task {
+                    if let Some(tm) = per_task.get_mut(chosen.0) {
+                        tm.times_scheduled += 1;
+                    }
+                }
             }
         });
 

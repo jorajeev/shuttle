@@ -140,8 +140,16 @@ impl<S: Scheduler + 'static> Runner<S> {
                     } else {
                         None
                     };
-                    if let Err(e) = writer.write_run_summary(seed, wall_time_ns, &metrics, rss) {
+                    let run = i as u64;
+                    if let Err(e) = writer.write_run_summary(run, seed, wall_time_ns, &metrics, rss) {
                         eprintln!("shuttle: failed to write metrics: {e}");
+                    }
+                    if writer.record_task_metrics() {
+                        if let Some(ref per_task) = metrics.per_task {
+                            if let Err(e) = writer.write_task_summaries(run, per_task) {
+                                eprintln!("shuttle: failed to write task metrics: {e}");
+                            }
+                        }
                     }
                 }
 

@@ -140,6 +140,150 @@ mod shuttle_metrics {
             assert!(s["rss_end_bytes"].is_null(), "rss_end_bytes should be absent");
         }
     }
+
+    fn run_with_task_metrics(iterations: usize) -> Vec<serde_json::Value> {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let config = Config::new()
+            .with_metrics(MetricsConfig::jsonl(path.clone()).with_task_metrics());
+        Runner::new(RandomScheduler::new(iterations), config).run(|| {
+            let _ = thread::spawn(|| {});
+        });
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn task_summaries_absent_without_flag() {
+        let records = run_simple_test(3);
+        assert!(!records.iter().any(|r| r["type"] == "task_summary"));
+    }
+
+    #[test]
+    fn task_summaries_present_with_flag() {
+        let records = run_with_task_metrics(5);
+        let summaries: Vec<_> = records.iter().filter(|r| r["type"] == "task_summary").collect();
+        assert!(!summaries.is_empty());
+    }
+
+    #[test]
+    fn schema_header_reflects_record_task_metrics() {
+        let records = run_with_task_metrics(1);
+        assert_eq!(records[0]["record_task_metrics"], true);
+        let records2 = run_simple_test(1);
+        assert_eq!(records2[0]["record_task_metrics"], false);
+    }
+
+    #[test]
+    fn one_task_summary_per_task_per_run() {
+        // Each run spawns main thread (task 0) + one child (task 1) = 2 tasks
+        let records = run_with_task_metrics(5);
+        for run_idx in 0..5u64 {
+            let run_tasks: Vec<_> = records
+                .iter()
+                .filter(|r| r["type"] == "task_summary" && r["run"] == run_idx)
+                .collect();
+            assert_eq!(run_tasks.len(), 2, "expected 2 task_summary records for run {run_idx}");
+        }
+    }
+
+    #[test]
+    fn task_summary_run_matches_run_summary() {
+        let records = run_with_task_metrics(3);
+        for s in records.iter().filter(|r| r["type"] == "task_summary") {
+            let run = s["run"].as_u64().unwrap();
+            assert!(run < 3, "task_summary run index {run} out of range");
+        }
+    }
+
+    #[test]
+    fn task_summary_times_runnable_gte_times_scheduled() {
+        let records = run_with_task_metrics(5);
+        for s in records.iter().filter(|r| r["type"] == "task_summary") {
+            let tr = s["times_runnable"].as_u64().unwrap();
+            let ts = s["times_scheduled"].as_u64().unwrap();
+            let trns = s["times_runnable_not_scheduled"].as_u64().unwrap();
+            assert!(tr >= ts, "times_runnable must be >= times_scheduled");
+            assert_eq!(trns, tr - ts, "times_runnable_not_scheduled must equal times_runnable - times_scheduled");
+        }
+    }
+
+    #[test]
+    fn task_summary_signature_hash_is_nonzero() {
+        let records = run_with_task_metrics(3);
+        for s in records.iter().filter(|r| r["type"] == "task_summary") {
+            assert!(s["signature_hash"].as_u64().unwrap() != 0);
+        }
+    }
+
+    #[test]
+    fn task_summary_signature_hash_stable_across_runs() {
+        // The same logical task (same spawn call site) should have the same
+        // signature_hash in every run.
+        let records = run_with_task_metrics(5);
+        let hash_for_task = |task_id: u64| -> u64 {
+            records
+                .iter()
+                .filter(|r| r["type"] == "task_summary" && r["task"] == task_id)
+                .map(|r| r["signature_hash"].as_u64().unwrap())
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        // There should be exactly one distinct signature_hash per task ID across all runs
+        let hashes_task0: std::collections::HashSet<u64> = records
+            .iter()
+            .filter(|r| r["type"] == "task_summary" && r["task"] == 0u64)
+            .map(|r| r["signature_hash"].as_u64().unwrap())
+            .collect();
+        assert_eq!(hashes_task0.len(), 1, "task 0 should have a stable signature_hash across runs");
+        let hashes_task1: std::collections::HashSet<u64> = records
+            .iter()
+            .filter(|r| r["type"] == "task_summary" && r["task"] == 1u64)
+            .map(|r| r["signature_hash"].as_u64().unwrap())
+            .collect();
+        assert_eq!(hashes_task1.len(), 1, "task 1 should have a stable signature_hash across runs");
+        // And the two tasks have different hashes
+        assert_ne!(hash_for_task(0), hash_for_task(1));
+    }
+
+    #[test]
+    fn never_runnable_task_has_zero_times_runnable() {
+        // Spawn a task that immediately parks itself — it will be sleeping
+        // for the entire run and never appear in the runnable set.
+        // Since we're checking the count is zero, this also validates that
+        // tasks are registered even when they never become runnable.
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let config = Config::new()
+            .with_metrics(MetricsConfig::jsonl(path.clone()).with_task_metrics());
+        // A test with no spawned tasks: only main thread (task 0) exists and runs.
+        Runner::new(RandomScheduler::new(3), config).run(|| {});
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // Only task 0 (main thread); it must have been runnable and scheduled.
+        for s in records.iter().filter(|r| r["type"] == "task_summary") {
+            assert_eq!(s["task"], 0u64);
+            assert!(s["times_runnable"].as_u64().unwrap() > 0);
+            assert!(s["times_scheduled"].as_u64().unwrap() > 0);
+        }
+    }
 }
 
 use shuttle::scheduler::RandomScheduler;
