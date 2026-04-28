@@ -26,8 +26,8 @@
 //! ```json
 //! {"type":"metrics_schema","version":1,"sample_memory":true,"record_task_metrics":true}
 //! {"type":"run_summary","run":0,"seed":12345,"wall_time_ns":1234567,...}
-//! {"type":"task_summary","run":0,"task":0,"signature_hash":9876543210,"times_scheduled":41,"times_runnable":183,"times_runnable_not_scheduled":142}
-//! {"type":"task_summary","run":0,"task":1,"signature_hash":1234567890,"times_scheduled":12,"times_runnable":12,"times_runnable_not_scheduled":0}
+//! {"type":"task_summary","run":0,"task":0,"signature_hash":9876543210,"times_scheduled":41,"times_runnable":183}
+//! {"type":"task_summary","run":0,"task":1,"signature_hash":1234567890,"times_scheduled":12,"times_runnable":12}
 //! ```
 
 use std::cell::RefCell;
@@ -77,11 +77,10 @@ impl MetricsConfig {
     ///   correlation across different seeds and iterations
     /// - `times_scheduled`: how many times this task was chosen by the scheduler
     /// - `times_runnable`: how many scheduling points this task was in the runnable set
-    /// - `times_runnable_not_scheduled`: `times_runnable - times_scheduled`
     ///
     /// From these you can answer:
     /// - Which tasks were scheduled most often (sort by `times_scheduled` desc)
-    /// - Which tasks were runnable but unchosen most often (`times_runnable_not_scheduled`)
+    /// - Which tasks were runnable but unchosen most often (`times_runnable - times_scheduled`)
     /// - Which tasks were almost always runnable (`times_runnable / scheduler_decisions`)
     /// - Which tasks were never runnable (`times_runnable == 0`)
     pub fn with_task_metrics(mut self) -> Self {
@@ -285,15 +284,13 @@ impl MetricsWriter {
                 self.writer,
                 concat!(
                     r#"{{"type":"task_summary","run":{run},"task":{task},"#,
-                    r#""signature_hash":{sig},"times_scheduled":{ts},"#,
-                    r#""times_runnable":{tr},"times_runnable_not_scheduled":{trns}}}"#,
+                    r#""signature_hash":{sig},"times_scheduled":{ts},"times_runnable":{tr}}}"#,
                 ),
                 run = run,
                 task = task_id,
                 sig = m.signature_hash,
                 ts = m.times_scheduled,
                 tr = m.times_in_runnable_set,
-                trns = m.times_in_runnable_set.saturating_sub(m.times_scheduled),
             )?;
         }
         self.writer.flush()?;

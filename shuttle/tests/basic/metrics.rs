@@ -208,9 +208,8 @@ mod shuttle_metrics {
         for s in records.iter().filter(|r| r["type"] == "task_summary") {
             let tr = s["times_runnable"].as_u64().unwrap();
             let ts = s["times_scheduled"].as_u64().unwrap();
-            let trns = s["times_runnable_not_scheduled"].as_u64().unwrap();
             assert!(tr >= ts, "times_runnable must be >= times_scheduled");
-            assert_eq!(trns, tr - ts, "times_runnable_not_scheduled must equal times_runnable - times_scheduled");
+            assert!(s.get("times_runnable_not_scheduled").is_none(), "redundant field should not be present");
         }
     }
 
