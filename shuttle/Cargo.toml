@@ -32,6 +32,7 @@ const-siphasher = "1.0.2"
 [dev-dependencies]
 criterion = { version = "0.4.0", features = ["html_reports"] }
 futures = "0.3.15"
+serde_json = "1.0"
 proptest = "1.0.0"
 proptest-derive = "0.5.0"
 regex = "1.5.5"
@@ -51,6 +52,7 @@ bench = false
 default = []
 vector-clocks = []
 annotation = ["dep:serde", "dep:serde_json", "dep:regex"]
+metrics = []
 # The following feature overrides the `vector-clocks` feature. It SHOULD NOT be used in production.
 # Its purpose is solely to allow `cargo bench` to be run without vector clocks enabled, as they
 # are otherwise always enabled via a dev-dependency to ensure all *test* assertions utilizing vector

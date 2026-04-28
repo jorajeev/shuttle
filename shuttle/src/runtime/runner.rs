@@ -55,6 +55,8 @@ impl Drop for ResetSpanOnDrop {
 pub struct Runner<S: ?Sized + Scheduler> {
     scheduler: Rc<RefCell<MetricsScheduler<S>>>,
     config: Config,
+    #[cfg(feature = "metrics")]
+    metrics_writer: Option<crate::metrics::MetricsWriter>,
 }
 
 impl<S: Scheduler + 'static> Runner<S> {
@@ -62,16 +64,26 @@ impl<S: Scheduler + 'static> Runner<S> {
     pub fn new(scheduler: S, config: Config) -> Self {
         let metrics_scheduler = MetricsScheduler::new(scheduler);
 
+        #[cfg(feature = "metrics")]
+        let metrics_writer = config.metrics.as_ref().and_then(|mc| {
+            crate::metrics::MetricsWriter::new(mc)
+                .map_err(|e| eprintln!("shuttle: failed to open metrics file: {e}"))
+                .ok()
+        });
+
         Self {
             scheduler: Rc::new(RefCell::new(metrics_scheduler)),
             config,
+            #[cfg(feature = "metrics")]
+            metrics_writer,
         }
     }
 
     /// Test the given function and return the number of times the function was invoked during the
     /// test (i.e., the number of iterations run).
     #[track_caller]
-    pub fn run<F>(self, f: F) -> usize
+    #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
+    pub fn run<F>(mut self, f: F) -> usize
     where
         F: Fn() + Send + Sync + 'static,
     {
@@ -96,6 +108,11 @@ impl<S: Scheduler + 'static> Runner<S> {
                     Some(s) => s,
                 };
 
+                #[cfg(feature = "metrics")]
+                let seed = schedule.seed();
+                #[cfg(feature = "metrics")]
+                let run_start = Instant::now();
+
                 let execution = Execution::new(self.scheduler.clone(), schedule);
                 let f = Arc::clone(&f);
 
@@ -106,6 +123,15 @@ impl<S: Scheduler + 'static> Runner<S> {
 
                 span!(Level::ERROR, "execution", i)
                     .in_scope(|| execution.run(&self.config, move || f(), Location::caller()));
+
+                #[cfg(feature = "metrics")]
+                if let Some(ref mut writer) = self.metrics_writer {
+                    let wall_time_ns = run_start.elapsed().as_nanos();
+                    let metrics = crate::metrics::RunMetrics::snapshot();
+                    if let Err(e) = writer.write_run_summary(seed, wall_time_ns, &metrics) {
+                        eprintln!("shuttle: failed to write metrics: {e}");
+                    }
+                }
 
                 i += 1;
             }

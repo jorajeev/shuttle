@@ -138,6 +138,9 @@ impl Execution {
     where
         F: FnOnce() + Send + 'static,
     {
+        #[cfg(feature = "metrics")]
+        crate::metrics::RunMetrics::reset();
+
         let state = RefCell::new(ExecutionState::new(config.clone(), Rc::clone(&self.scheduler)));
 
         init_panic_hook(config.clone());
@@ -750,6 +753,8 @@ impl ExecutionState {
     pub(crate) fn next_u64() -> u64 {
         Self::with(|state| {
             CurrentSchedule::push_random();
+            #[cfg(feature = "metrics")]
+            crate::metrics::RunMetrics::with_current(|m| m.random_choices += 1);
             state.scheduler.borrow_mut().next_u64()
         })
     }
@@ -915,6 +920,22 @@ impl ExecutionState {
             .map(ScheduledTask::Some)
             .unwrap_or(ScheduledTask::Stopped);
 
+        #[cfg(feature = "metrics")]
+        crate::metrics::RunMetrics::with_current(|m| {
+            m.scheduler_decisions += 1;
+            let runnable = task_refs.len() as u64;
+            if runnable > m.max_runnable_tasks {
+                m.max_runnable_tasks = runnable;
+            }
+            let live = self.tasks.len() as u64;
+            if live > m.max_live_tasks {
+                m.max_live_tasks = live;
+            }
+            if is_yielding {
+                m.task_yields += 1;
+            }
+        });
+
         // Tracing this `in_scope` is purely a matter of taste. We do it because
         // 1) It is an action taken by the scheduler, and should thus be traced under the scheduler's span
         // 2) It creates a visual separation of scheduling decisions and `Task`-induced tracing.
@@ -952,7 +973,16 @@ impl ExecutionState {
     /// Set the next task as the current task
     fn advance_to_next_task(&mut self) {
         debug_assert_ne!(self.next_task, ScheduledTask::None);
+        #[cfg(feature = "metrics")]
+        let prev = self.current_task;
         self.current_task = self.next_task.take();
+
+        #[cfg(feature = "metrics")]
+        if let (ScheduledTask::Some(prev_id), ScheduledTask::Some(next_id)) = (prev, self.current_task) {
+            if prev_id != next_id {
+                crate::metrics::RunMetrics::with_current(|m| m.context_switches += 1);
+            }
+        }
 
         if let ScheduledTask::Some(tid) = self.current_task {
             CurrentSchedule::push_task(tid);

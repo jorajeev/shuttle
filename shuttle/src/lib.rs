@@ -184,6 +184,8 @@ pub mod annotations;
 pub mod future;
 pub mod hint;
 pub mod lazy_static;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod rand;
 pub mod sync;
 pub mod thread;
@@ -245,6 +247,13 @@ pub struct Config {
 
     /// The config to define how to handle ungraceful shutdowns, ie. when the test panics.
     pub ungraceful_shutdown_config: UngracefulShutdownConfig,
+
+    /// Metrics collection configuration. When set, Shuttle writes one JSON Lines record per
+    /// execution to the specified file.
+    ///
+    /// Requires the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    pub metrics: Option<metrics::MetricsConfig>,
 }
 
 std::thread_local! {
@@ -323,7 +332,18 @@ impl Config {
             silence_warnings: false,
             record_steps_in_span: false,
             ungraceful_shutdown_config: UngracefulShutdownConfig::default(),
+            #[cfg(feature = "metrics")]
+            metrics: None,
         }
+    }
+
+    /// Enable metrics collection, writing JSON Lines records to the configured output.
+    ///
+    /// Requires the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    pub fn with_metrics(mut self, config: metrics::MetricsConfig) -> Self {
+        self.metrics = Some(config);
+        self
     }
 }
 

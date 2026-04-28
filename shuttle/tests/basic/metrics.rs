@@ -1,3 +1,89 @@
+#[cfg(feature = "metrics")]
+mod shuttle_metrics {
+    use shuttle::metrics::MetricsConfig;
+    use shuttle::scheduler::RandomScheduler;
+    use shuttle::{thread, Config, Runner};
+    use tempfile::NamedTempFile;
+
+    fn run_simple_test(iterations: usize) -> Vec<serde_json::Value> {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let config = Config::new().with_metrics(MetricsConfig::jsonl(path.clone()));
+        Runner::new(RandomScheduler::new(iterations), config).run(|| {
+            let _ = thread::spawn(|| {});
+        });
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn schema_header_is_first_line() {
+        let records = run_simple_test(5);
+        assert!(!records.is_empty());
+        assert_eq!(records[0]["type"], "metrics_schema");
+        assert_eq!(records[0]["version"], 1);
+    }
+
+    #[test]
+    fn one_run_summary_per_iteration() {
+        let iterations = 10;
+        let records = run_simple_test(iterations);
+        let summaries: Vec<_> = records.iter().filter(|r| r["type"] == "run_summary").collect();
+        assert_eq!(summaries.len(), iterations);
+    }
+
+    #[test]
+    fn run_indices_are_sequential() {
+        let records = run_simple_test(5);
+        let summaries: Vec<_> = records.iter().filter(|r| r["type"] == "run_summary").collect();
+        for (i, s) in summaries.iter().enumerate() {
+            assert_eq!(s["run"], i);
+        }
+    }
+
+    #[test]
+    fn scheduler_decisions_are_positive() {
+        let records = run_simple_test(3);
+        for s in records.iter().filter(|r| r["type"] == "run_summary") {
+            assert!(s["scheduler_decisions"].as_u64().unwrap() > 0);
+        }
+    }
+
+    #[test]
+    fn task_completions_match_spawned_tasks() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let config = Config::new().with_metrics(MetricsConfig::jsonl(path.clone()));
+        Runner::new(RandomScheduler::new(10), config).run(|| {
+            // spawns one child + main thread = 2 tasks finish each run
+            let _ = thread::spawn(|| {});
+        });
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        for line in content.lines().filter(|l| !l.is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            if v["type"] == "run_summary" {
+                assert_eq!(v["task_completions"].as_u64().unwrap(), 2, "expected 2 task completions");
+            }
+        }
+    }
+
+    #[test]
+    fn wall_time_ns_is_positive() {
+        let records = run_simple_test(3);
+        for s in records.iter().filter(|r| r["type"] == "run_summary") {
+            assert!(s["wall_time_ns"].as_u64().unwrap() > 0);
+        }
+    }
+}
+
 use shuttle::scheduler::RandomScheduler;
 use shuttle::{check_random, thread, Runner};
 use std::panic::{catch_unwind, AssertUnwindSafe};
