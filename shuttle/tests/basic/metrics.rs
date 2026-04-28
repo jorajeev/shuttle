@@ -82,6 +82,64 @@ mod shuttle_metrics {
             assert!(s["wall_time_ns"].as_u64().unwrap() > 0);
         }
     }
+
+    #[test]
+    fn schema_header_reflects_sample_memory_false() {
+        let records = run_simple_test(1);
+        assert_eq!(records[0]["sample_memory"], false);
+    }
+
+    #[test]
+    fn schema_header_reflects_sample_memory_true() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let config = Config::new()
+            .with_metrics(MetricsConfig::jsonl(path.clone()).with_memory_sampling());
+        Runner::new(RandomScheduler::new(1), config).run(|| {});
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(records[0]["sample_memory"], true);
+    }
+
+    /// RSS fields are present when memory sampling is enabled and omitted when disabled.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn rss_fields_present_when_sampling_enabled() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+
+        let config = Config::new()
+            .with_metrics(MetricsConfig::jsonl(path.clone()).with_memory_sampling());
+        Runner::new(RandomScheduler::new(3), config).run(|| {
+            let _ = thread::spawn(|| {});
+        });
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        for line in content.lines().filter(|l| !l.is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line).unwrap();
+            if v["type"] == "run_summary" {
+                assert!(v["rss_start_bytes"].is_number(), "rss_start_bytes missing");
+                assert!(v["rss_end_bytes"].is_number(), "rss_end_bytes missing");
+                assert!(v["rss_start_bytes"].as_u64().unwrap() > 0);
+                assert!(v["rss_end_bytes"].as_u64().unwrap() > 0);
+            }
+        }
+    }
+
+    #[test]
+    fn rss_fields_absent_when_sampling_disabled() {
+        let records = run_simple_test(3);
+        for s in records.iter().filter(|r| r["type"] == "run_summary") {
+            assert!(s["rss_start_bytes"].is_null(), "rss_start_bytes should be absent");
+            assert!(s["rss_end_bytes"].is_null(), "rss_end_bytes should be absent");
+        }
+    }
 }
 
 use shuttle::scheduler::RandomScheduler;

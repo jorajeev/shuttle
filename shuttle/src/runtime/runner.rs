@@ -112,6 +112,12 @@ impl<S: Scheduler + 'static> Runner<S> {
                 let seed = schedule.seed();
                 #[cfg(feature = "metrics")]
                 let run_start = Instant::now();
+                #[cfg(feature = "metrics")]
+                let rss_start = self
+                    .metrics_writer
+                    .as_ref()
+                    .filter(|w| w.sample_memory())
+                    .and_then(|_| crate::metrics::sample_rss_bytes());
 
                 let execution = Execution::new(self.scheduler.clone(), schedule);
                 let f = Arc::clone(&f);
@@ -128,7 +134,13 @@ impl<S: Scheduler + 'static> Runner<S> {
                 if let Some(ref mut writer) = self.metrics_writer {
                     let wall_time_ns = run_start.elapsed().as_nanos();
                     let metrics = crate::metrics::RunMetrics::snapshot();
-                    if let Err(e) = writer.write_run_summary(seed, wall_time_ns, &metrics) {
+                    let rss = if writer.sample_memory() {
+                        let rss_end = crate::metrics::sample_rss_bytes();
+                        rss_start.zip(rss_end)
+                    } else {
+                        None
+                    };
+                    if let Err(e) = writer.write_run_summary(seed, wall_time_ns, &metrics, rss) {
                         eprintln!("shuttle: failed to write metrics: {e}");
                     }
                 }

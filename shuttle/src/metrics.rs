@@ -10,7 +10,9 @@
 //! use shuttle::metrics::MetricsConfig;
 //! use shuttle::{Config, Runner, scheduler::RandomScheduler};
 //!
-//! let config = Config { metrics: Some(MetricsConfig::jsonl("shuttle-metrics.jsonl")), ..Config::new() };
+//! let config = Config::new().with_metrics(
+//!     MetricsConfig::jsonl("shuttle-metrics.jsonl").with_memory_sampling()
+//! );
 //! Runner::new(RandomScheduler::new(100), config).run(|| {
 //!     // test body
 //! });
@@ -20,8 +22,8 @@
 //! Each run produces one JSON Lines record in the output file:
 //!
 //! ```json
-//! {"type":"metrics_schema","version":1}
-//! {"type":"run_summary","run":0,"seed":12345,"wall_time_ns":1234567,...}
+//! {"type":"metrics_schema","version":1,"sample_memory":true}
+//! {"type":"run_summary","run":0,"seed":12345,"wall_time_ns":1234567,...,"rss_start_bytes":81264640,"rss_end_bytes":98402304}
 //! ```
 
 use std::cell::RefCell;
@@ -34,6 +36,9 @@ use std::path::PathBuf;
 pub struct MetricsConfig {
     /// Path to the JSON Lines output file.
     pub output: PathBuf,
+    /// When true, sample process RSS before and after each execution and include
+    /// `rss_start_bytes` / `rss_end_bytes` in every `run_summary` record.
+    pub sample_memory: bool,
 }
 
 impl MetricsConfig {
@@ -41,7 +46,22 @@ impl MetricsConfig {
     ///
     /// The file is created (or truncated) when [`Runner::run`](crate::Runner::run) starts.
     pub fn jsonl(path: impl Into<PathBuf>) -> Self {
-        Self { output: path.into() }
+        Self {
+            output: path.into(),
+            sample_memory: false,
+        }
+    }
+
+    /// Enable per-run RSS sampling.
+    ///
+    /// Adds `rss_start_bytes` and `rss_end_bytes` fields to every `run_summary` record.
+    /// The delta `rss_end_bytes - rss_start_bytes` shows how much process memory grew
+    /// during a single Shuttle execution (user code + Shuttle overhead combined).
+    ///
+    /// Currently supported on Linux only; the fields are omitted on other platforms.
+    pub fn with_memory_sampling(mut self) -> Self {
+        self.sample_memory = true;
+        self
     }
 }
 
@@ -90,11 +110,32 @@ impl RunMetrics {
     }
 }
 
+/// Return the current process RSS in bytes, or `None` if unavailable.
+///
+/// Reads `/proc/self/status` on Linux. Returns `None` on all other platforms.
+pub(crate) fn sample_rss_bytes() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        // VmRSS line looks like: "VmRSS:   12345 kB"
+        let status = std::fs::read_to_string("/proc/self/status").ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
 /// Writes per-run metric summaries as JSON Lines to a file.
 #[derive(Debug)]
 pub(crate) struct MetricsWriter {
     writer: BufWriter<File>,
     run_index: u64,
+    sample_memory: bool,
 }
 
 impl MetricsWriter {
@@ -102,25 +143,42 @@ impl MetricsWriter {
     pub(crate) fn new(config: &MetricsConfig) -> std::io::Result<Self> {
         let file = File::create(&config.output)?;
         let mut writer = BufWriter::new(file);
-        writeln!(writer, r#"{{"type":"metrics_schema","version":1}}"#)?;
+        writeln!(
+            writer,
+            r#"{{"type":"metrics_schema","version":1,"sample_memory":{sm}}}"#,
+            sm = config.sample_memory,
+        )?;
         writer.flush()?;
-        Ok(Self { writer, run_index: 0 })
+        Ok(Self {
+            writer,
+            run_index: 0,
+            sample_memory: config.sample_memory,
+        })
+    }
+
+    /// Whether this writer is configured to record RSS samples.
+    pub(crate) fn sample_memory(&self) -> bool {
+        self.sample_memory
     }
 
     /// Append one `run_summary` record and flush.
+    ///
+    /// `rss` is `Some((start_bytes, end_bytes))` when memory sampling is enabled and
+    /// the platform supports it; `None` otherwise.
     pub(crate) fn write_run_summary(
         &mut self,
         seed: u64,
         wall_time_ns: u128,
         m: &RunMetrics,
+        rss: Option<(u64, u64)>,
     ) -> std::io::Result<()> {
-        writeln!(
+        write!(
             self.writer,
             concat!(
                 r#"{{"type":"run_summary","run":{run},"seed":{seed},"wall_time_ns":{wt},"#,
                 r#""scheduler_decisions":{sd},"context_switches":{cs},"task_yields":{ty},"#,
                 r#""task_blocks":{tb},"task_unblocks":{tu},"task_completions":{tc},"#,
-                r#""random_choices":{rc},"max_runnable_tasks":{mrt},"max_live_tasks":{mlt}}}"#,
+                r#""random_choices":{rc},"max_runnable_tasks":{mrt},"max_live_tasks":{mlt}"#,
             ),
             run = self.run_index,
             seed = seed,
@@ -135,6 +193,17 @@ impl MetricsWriter {
             mrt = m.max_runnable_tasks,
             mlt = m.max_live_tasks,
         )?;
+
+        if let Some((start, end)) = rss {
+            write!(
+                self.writer,
+                r#","rss_start_bytes":{start},"rss_end_bytes":{end}"#,
+                start = start,
+                end = end,
+            )?;
+        }
+
+        writeln!(self.writer, "}}")?;
         self.writer.flush()?;
         self.run_index += 1;
         Ok(())
