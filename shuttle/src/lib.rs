@@ -190,6 +190,8 @@ pub mod thread;
 
 pub mod current;
 pub mod scheduler;
+#[cfg(feature = "metrics")]
+pub mod scheduler_log;
 
 mod runtime;
 
@@ -245,6 +247,14 @@ pub struct Config {
 
     /// The config to define how to handle ungraceful shutdowns, ie. when the test panics.
     pub ungraceful_shutdown_config: UngracefulShutdownConfig,
+
+    /// Scheduler step log configuration. When set, Shuttle writes a compact binary record of every
+    /// scheduling decision (chosen task + runnable-set delta) to the specified file, compressed
+    /// with zstd. Use the `sched_log_decode` binary to read the output.
+    ///
+    /// Requires the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    pub scheduler_log: Option<scheduler_log::SchedulerLogConfig>,
 }
 
 std::thread_local! {
@@ -323,7 +333,19 @@ impl Config {
             silence_warnings: false,
             record_steps_in_span: false,
             ungraceful_shutdown_config: UngracefulShutdownConfig::default(),
+            #[cfg(feature = "metrics")]
+            scheduler_log: None,
         }
+    }
+
+    /// Enable scheduler step logging, writing a compact zstd-compressed binary log to the
+    /// configured path. Use the `sched_log_decode` binary to inspect the output.
+    ///
+    /// Requires the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    pub fn with_scheduler_log(mut self, config: scheduler_log::SchedulerLogConfig) -> Self {
+        self.scheduler_log = Some(config);
+        self
     }
 }
 

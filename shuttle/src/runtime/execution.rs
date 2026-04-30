@@ -915,6 +915,15 @@ impl ExecutionState {
             .map(ScheduledTask::Some)
             .unwrap_or(ScheduledTask::Stopped);
 
+        #[cfg(feature = "metrics")]
+        if let ScheduledTask::Some(chosen) = self.next_task {
+            // task_refs is iterated in task-ID order (tasks are stored by ID in self.tasks),
+            // so the resulting slice is sorted — a precondition of write_step's delta encoding.
+            let runnable_ids: SmallVec<[u32; 64]> =
+                task_refs.iter().map(|t| t.id().0 as u32).collect();
+            crate::scheduler_log::write_step(chosen.0 as u32, &runnable_ids);
+        }
+
         // Tracing this `in_scope` is purely a matter of taste. We do it because
         // 1) It is an action taken by the scheduler, and should thus be traced under the scheduler's span
         // 2) It creates a visual separation of scheduling decisions and `Task`-induced tracing.

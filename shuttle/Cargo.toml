@@ -28,9 +28,12 @@ regex = { version = "1.10.6", optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
 const-siphasher = "1.0.2"
+# for metrics / scheduler log
+zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8", features = ["html_reports"] }
+zstd = "0.13"
 futures = "0.3.15"
 proptest = "1.0.0"
 proptest-derive = "0.5.0"
@@ -51,11 +54,17 @@ bench = false
 default = []
 vector-clocks = []
 annotation = ["dep:serde", "dep:serde_json", "dep:regex"]
+metrics = ["dep:zstd"]
 # The following feature overrides the `vector-clocks` feature. It SHOULD NOT be used in production.
 # Its purpose is solely to allow `cargo bench` to be run without vector clocks enabled, as they
 # are otherwise always enabled via a dev-dependency to ensure all *test* assertions utilizing vector
 # clocks behave correctly during testing
 bench-no-vector-clocks = []
+
+[[bin]]
+name = "sched_log_decode"
+path = "src/bin/sched_log_decode.rs"
+required-features = ["metrics"]
 
 [[bench]]
 name = "lock"

@@ -84,6 +84,14 @@ impl<S: Scheduler + 'static> Runner<S> {
 
             let start = Instant::now();
 
+            #[cfg(feature = "metrics")]
+            if let Some(ref log_config) = self.config.scheduler_log {
+                match crate::scheduler_log::SchedulerLogWriter::new(log_config) {
+                    Ok(writer) => crate::scheduler_log::install(writer),
+                    Err(e) => eprintln!("shuttle: failed to open scheduler log: {e}"),
+                }
+            }
+
             let mut i = 0;
 
             loop {
@@ -96,6 +104,12 @@ impl<S: Scheduler + 'static> Runner<S> {
                     Some(s) => s,
                 };
 
+                #[cfg(feature = "metrics")]
+                let seed = schedule.seed();
+
+                #[cfg(feature = "metrics")]
+                crate::scheduler_log::run_start(i as u64, seed);
+
                 let execution = Execution::new(self.scheduler.clone(), schedule);
                 let f = Arc::clone(&f);
 
@@ -107,8 +121,19 @@ impl<S: Scheduler + 'static> Runner<S> {
                 span!(Level::ERROR, "execution", i)
                     .in_scope(|| execution.run(&self.config, move || f(), Location::caller()));
 
+                #[cfg(feature = "metrics")]
+                crate::scheduler_log::run_end(i as u64);
+
                 i += 1;
             }
+
+            #[cfg(feature = "metrics")]
+            if let Some(writer) = crate::scheduler_log::uninstall() {
+                if let Err(e) = writer.finish() {
+                    eprintln!("shuttle: failed to finalize scheduler log: {e}");
+                }
+            }
+
             i
         })
     }

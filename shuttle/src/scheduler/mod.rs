@@ -68,6 +68,12 @@ impl Schedule {
         self.steps.push(ScheduleStep::Random);
     }
 
+    /// Return the seed used for this schedule.
+    #[cfg(feature = "metrics")]
+    pub(crate) fn seed(&self) -> u64 {
+        self.seed
+    }
+
     /// Return the number of steps in the schedule.
     pub fn len(&self) -> usize {
         self.steps.len()

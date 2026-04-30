@@ -17,6 +17,7 @@ mod portfolio;
 mod replay;
 mod rwlock;
 mod shrink;
+mod scheduler_log;
 mod tag;
 mod task;
 mod thread;
