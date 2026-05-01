@@ -141,6 +141,7 @@ impl Execution {
         let state = RefCell::new(ExecutionState::new(config.clone(), Rc::clone(&self.scheduler)));
 
         init_panic_hook(config.clone());
+        crate::runtime::failure::reset_panic_hook_state();
         CurrentSchedule::init(self.initial_schedule.clone());
         UNGRACEFUL_SHUTDOWN_CONFIG.set(config.ungraceful_shutdown_config);
 
@@ -160,8 +161,6 @@ impl Execution {
 
                         match e {
                             StepError::TaskFailure(payload) => {
-                                eprintln!("test panicked in task '{}'", ExecutionState::failing_task());
-
                                 panic::resume_unwind(payload);
                             }
                             StepError::Deadlock => {

@@ -18,6 +18,16 @@ use crate::{Config, FailurePersistence};
 // When we last persisted a schedule. Used so that we don't persist the same schedule twice.
 thread_local! {
     static SCHEDULE_PERSISTED_AT: Cell<usize> = const { Cell::new(0) };
+    // Set to true after the first panic in an execution, so that secondary panics (e.g. from
+    // `resume_unwind` re-raising the same panic, or from drop handlers during cleanup) don't
+    // produce redundant output that obscures the original failure.
+    static FIRST_PANIC_HANDLED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Reset per-execution panic-hook state. Must be called at the start of each new execution so
+/// that the suppression flag doesn't carry over from a previous failing run.
+pub(crate) fn reset_panic_hook_state() {
+    FIRST_PANIC_HANDLED.set(false);
 }
 
 /// Persist (to stderr or to file) a message describing how to replay a failing schedule.
@@ -93,7 +103,13 @@ pub fn init_panic_hook(config: Config) {
     INIT.call_once(|| {
         let original_hook = panic::take_hook();
         panic::set_hook(Box::new(move |panic_info| {
-            eprintln!("Task failed, serializing schedule");
+            // Suppress secondary panics (e.g. the same panic re-raised by `resume_unwind`, or
+            // panics in drop handlers during cleanup). Only the first panic in an execution
+            // carries useful diagnostic information; subsequent ones just clutter the output and
+            // make it hard to spot the original failure.
+            if FIRST_PANIC_HANDLED.replace(true) {
+                return;
+            }
             let task_name = ExecutionState::failing_task();
             eprintln!("test panicked in task '{task_name}'");
             persist_failure(&config);
