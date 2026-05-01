@@ -1,0 +1,19 @@
+[package]
+name = "shuttle-schedulers"
+version = "0.9.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Scheduler implementations for Shuttle concurrency testing"
+repository = "https://github.com/awslabs/shuttle"
+
+[features]
+default = []
+vector-clocks = ["shuttle-core/vector-clocks"]
+annotation = ["shuttle-core/annotation"]
+
+[dependencies]
+shuttle-core = { path = "../shuttle-core" }
+rand = "0.8.6"
+rand_pcg = "0.3.1"
+smallvec = { version = "1.11.2", features = ["const_new"] }
+tracing = { version = "0.1.36", default-features = false, features = ["std"] }

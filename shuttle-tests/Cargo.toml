@@ -1,0 +1,8 @@
+[package]
+name = "shuttle-tests"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dev-dependencies]
+shuttle = { path = "../shuttle", features = ["vector-clocks"] }

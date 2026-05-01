@@ -1,0 +1,33 @@
+[package]
+name = "shuttle-core"
+version = "0.9.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Core runtime and scheduler trait for Shuttle concurrency testing"
+repository = "https://github.com/awslabs/shuttle"
+
+[features]
+default = []
+vector-clocks = []
+bench-no-vector-clocks = []
+annotation = ["dep:serde", "dep:serde_json", "dep:regex"]
+
+[dependencies]
+bitvec = "1.0.1"
+cfg-if = "1.0"
+corosensei = "0.3.1"
+const-siphasher = "1.0.2"
+hex = "0.4.2"
+rand = "0.8.6"
+rand_pcg = "0.3.1"
+scoped-tls = "1.0.0"
+smallvec = { version = "1.11.2", features = ["const_new"] }
+tracing = { version = "0.1.36", default-features = false, features = ["std"] }
+
+# Optional (annotation feature)
+regex = { version = "1.10.6", optional = true }
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
+
+[dev-dependencies]
+proptest = "1.0.0"

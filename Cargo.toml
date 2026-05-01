@@ -1,6 +1,10 @@
 [workspace]
 members = [
     "shuttle",
+    "shuttle-core",
+    "shuttle-schedulers",
+    "shuttle-sync",
+    "shuttle-tests",
     "wrappers/shuttle_rand_0.8",
     "wrappers/shuttle_sync",
     "wrappers/collections",

@@ -1,0 +1,21 @@
+[package]
+name = "shuttle-sync"
+version = "0.9.1"
+edition = "2021"
+license = "Apache-2.0"
+description = "Synchronization primitives for Shuttle concurrency testing"
+repository = "https://github.com/awslabs/shuttle"
+
+[features]
+default = []
+vector-clocks = ["shuttle-core/vector-clocks"]
+annotation = ["shuttle-core/annotation"]
+
+[dependencies]
+shuttle-core = { path = "../shuttle-core" }
+assoc = "0.1.3"
+owo-colors = "4.3.0"
+rand = "0.8.6"
+rand_core = "0.6.4"
+smallvec = { version = "1.11.2", features = ["const_new"] }
+tracing = { version = "0.1.36", default-features = false, features = ["std"] }
