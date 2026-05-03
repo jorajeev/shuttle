@@ -153,7 +153,10 @@ impl Notify {
             trace!("notify_one for {:?} waking waiter {:?}", self, waiter.id);
             // Must set flag before notifying waiter
             waiter.flag.store(NOTIFIED, Ordering::SeqCst);
-            waiter.tx.send(()).unwrap();
+            // The notification is delivered via the flag; the send is only to wake
+            // the receiver. If the receiver already saw the flag and was dropped
+            // (possible because send() yields before the actual send), ignore the error.
+            let _ = waiter.tx.send(());
         }
     }
 

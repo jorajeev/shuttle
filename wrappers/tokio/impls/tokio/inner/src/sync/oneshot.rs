@@ -71,16 +71,15 @@ impl<T> Sender<T> {
     /// not be sent.
     pub fn send(self, t: T) -> Result<(), T> {
         trace!("Sending message on oneshot {:p}", &self.0);
-        let send_result = self.0.send(t);
         shuttle::thread::yield_now();
-        send_result
+        self.0.send(t)
     }
 
     /// Waits for the associated [`Receiver`] handle to close.
     pub async fn closed(&mut self) {
         trace!("sender closing oneshot {:p}", &self.0);
-        self.0.cancellation().await;
         shuttle::future::yield_now().await;
+        self.0.cancellation().await;
     }
 
     /// Returns `true` if the associated [`Receiver`] handle has been dropped.
@@ -102,19 +101,18 @@ impl<T> Sender<T> {
 impl<T> Receiver<T> {
     /// Prevents the associated [`Sender`] handle from sending a value.
     pub fn close(&mut self) {
-        self.0.close();
         shuttle::thread::yield_now();
+        self.0.close();
     }
 
     /// Attempts to receive a value.
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
-        let out = match self.0.try_recv() {
+        shuttle::thread::yield_now();
+        match self.0.try_recv() {
             Ok(Some(v)) => Ok(v),
             Ok(None) => Err(TryRecvError::Empty),
             Err(_) => Err(TryRecvError::Closed),
-        };
-        shuttle::thread::yield_now();
-        out
+        }
     }
 
     /// Blocking receive to call outside of asynchronous contexts.
@@ -137,7 +135,8 @@ impl<T> Future for Receiver<T> {
         trace!("polling oneshot receiver {:p}", receiver);
         let poll_result = receiver.poll(cx).map_err(|_| RecvError(()));
         if poll_result.is_ready() {
-            // Force a yield
+            // Scheduling point after the receive is complete; safe here because
+            // the future is done and won't be re-polled.
             shuttle::thread::yield_now();
         }
         poll_result
