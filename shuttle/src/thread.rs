@@ -10,6 +10,13 @@ use std::time::Duration;
 
 pub use std::thread::{panicking, Result};
 
+/// Returns `true` if the current Shuttle execution is shutting down (either due to a panic,
+/// all tasks completing, or being stopped by the scheduler). Drop handlers for Shuttle
+/// primitives should call this and skip scheduling-related work if it returns `true`.
+pub fn should_stop() -> bool {
+    ExecutionState::should_stop()
+}
+
 /// A unique identifier for a running thread
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ThreadId {

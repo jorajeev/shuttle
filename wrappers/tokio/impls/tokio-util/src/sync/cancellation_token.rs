@@ -122,6 +122,9 @@ impl Clone for CancellationToken {
 
 impl Drop for CancellationToken {
     fn drop(&mut self) {
+        if shuttle::thread::should_stop() {
+            return;
+        }
         tree_node::decrease_handle_refcount(&self.inner);
     }
 }

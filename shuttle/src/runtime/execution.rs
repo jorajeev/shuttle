@@ -723,12 +723,18 @@ impl ExecutionState {
     /// panic triggered while someone held a Mutex, and so are executing the Drop handler for
     /// MutexGuard). This avoids calling back into the scheduler during a panic, because the state
     /// may be poisoned or otherwise invalid.
+    ///
+    /// This function is designed to be safe to call from Drop handlers: it uses `try_with` to
+    /// avoid panicking if the state is already borrowed or not set, and returns `true` in those
+    /// cases to prevent Drop handlers from attempting further scheduler interaction.
     pub(crate) fn should_stop() -> bool {
         std::thread::panicking()
-            || Self::with(|s| {
-                assert_ne!(s.current_task, ScheduledTask::Finished);
-                s.current_task == ScheduledTask::Stopped
+            || Self::try_with(|s| {
+                s.in_cleanup
+                    || s.current_task == ScheduledTask::Stopped
+                    || s.current_task == ScheduledTask::Finished
             })
+            .unwrap_or(true)
     }
 
     /// Generate some diagnostic information used when persisting failures.

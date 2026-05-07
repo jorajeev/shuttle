@@ -18,6 +18,9 @@ impl DropGuard {
 
 impl Drop for DropGuard {
     fn drop(&mut self) {
+        if shuttle::thread::should_stop() {
+            return;
+        }
         if let Some(inner) = &self.inner {
             inner.cancel();
         }

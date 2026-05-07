@@ -660,6 +660,9 @@ impl Drop for TaskTrackerToken {
     /// Dropping the token indicates to the [`TaskTracker`] that the task has exited.
     #[inline]
     fn drop(&mut self) {
+        if shuttle::thread::should_stop() {
+            return;
+        }
         self.task_tracker.inner.drop_task();
     }
 }

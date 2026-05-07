@@ -393,6 +393,9 @@ impl BatchSemaphore {
     /// Closes the semaphore. This prevents the semaphore from issuing new
     /// permits and notifies all pending waiters.
     pub fn close(&self) {
+        if ExecutionState::should_stop() {
+            return;
+        }
         thread::switch();
         self.close_no_scheduling_point();
     }
@@ -555,6 +558,22 @@ impl BatchSemaphore {
 
     /// Release `num_permits` back to the Semaphore
     pub fn release(&self, num_permits: usize) {
+        if ExecutionState::should_stop() {
+            // During panic: release permits and clear waiters so tasks blocked on this semaphore
+            // can detect the poisoned state. This correctly models lock poisoning. During other
+            // forms of teardown (in_cleanup, Stopped, Finished), skip entirely.
+            if std::thread::panicking() && num_permits > 0 {
+                let mut state = self.state.borrow_mut();
+                state.permits_available.release(num_permits, VectorClock::new());
+                for waiter in &state.waiters {
+                    waiter.is_queued.swap(false, Ordering::SeqCst);
+                }
+                state.waiters.clear();
+                state.closed = true;
+            }
+            return;
+        }
+
         thread::switch();
 
         self.init_object_id();
@@ -565,22 +584,6 @@ impl BatchSemaphore {
         let mut state = self.state.borrow_mut();
 
         crate::annotations::record_semaphore_release(state.id.unwrap(), num_permits);
-
-        if ExecutionState::should_stop() {
-            // In case we are panicking, we release permits, but also clear
-            // the waiters queue: we should not unblock the threads at this
-            // point. However, the permits are released such that future
-            // acquires may succeed, as long as the requesters were not
-            // blocking on the semaphore at the time of the panic. This is
-            // used to correctly model lock poisoning.
-            state.permits_available.release(num_permits, VectorClock::new());
-            for waiter in &state.waiters {
-                waiter.is_queued.swap(false, Ordering::SeqCst);
-            }
-            state.waiters.clear();
-            state.closed = true;
-            return;
-        }
 
         // Permits released into the semaphore reflect the releasing thread's
         // clock; future acquires of those permits are causally dependent on
@@ -819,6 +822,9 @@ impl Future for Acquire<'_> {
 
 impl Drop for Acquire<'_> {
     fn drop(&mut self) {
+        if ExecutionState::should_stop() {
+            return;
+        }
         trace!("Acquire::drop for Acquire {:p} with waiter {:?}", self, self.waiter);
         if self.waiter.is_queued.load(Ordering::SeqCst) {
             // If the associated waiter is in the wait list, remove it
