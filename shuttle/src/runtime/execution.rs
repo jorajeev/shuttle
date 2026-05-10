@@ -2,9 +2,11 @@ use crate::runtime::failure::{init_panic_hook, persist_failure};
 use crate::runtime::storage::{StorageKey, StorageMap};
 use crate::runtime::task::clock::VectorClock;
 use crate::runtime::task::labels::Labels;
-use crate::runtime::task::{ChildLabelFn, Task, TaskId, TaskName, TaskSignature, DEFAULT_INLINE_TASKS};
+use crate::runtime::task::{ChildLabelFn, Task, TaskBody, TaskId, TaskName, TaskSignature, DEFAULT_INLINE_TASKS};
 use crate::runtime::thread;
-use crate::runtime::thread::continuation::PooledContinuation;
+use crate::runtime::thread::continuation::{
+    clear_async_runner_yielder, set_async_runner_yielder, ContinuationPool, PooledContinuation,
+};
 use crate::scheduler::{Schedule, Scheduler};
 use crate::sync::{ResourceSignature, ResourceType};
 use crate::thread::thread_fn;
@@ -17,8 +19,10 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::panic::{self, Location};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tracing::{trace, Span};
 
 #[allow(deprecated)]
@@ -244,20 +248,40 @@ impl Execution {
     /// Run the execution to completion.
     #[inline]
     fn run_to_completion(&mut self, immediately_return_on_panic: bool) -> Result<(), StepError> {
+        // Read config once so it's available without borrowing ExecutionState inside the loop.
+        let stack_size = ExecutionState::with(|state| state.config.stack_size);
+
+        enum NextStep {
+            // Resume a coroutine-based task (thread tasks and block_on).
+            Continuation(Rc<RefCell<PooledContinuation>>),
+            // Poll an async future task.
+            AsyncPoll {
+                // Raw pointer to the future on the task. Valid for the entire execution.
+                future_ptr: *mut Pin<Box<dyn Future<Output = ()>>>,
+                // In-flight runner (task was blocked mid-poll), or None to start a fresh poll.
+                runner: Option<Rc<RefCell<PooledContinuation>>>,
+            },
+        }
+
         loop {
-            let next_step: Option<Rc<RefCell<PooledContinuation>>> = ExecutionState::with(|state| {
+            let next_step: Option<NextStep> = ExecutionState::with(|state| {
                 state.schedule()?;
                 state.advance_to_next_task();
 
                 match state.current_task {
                     ScheduledTask::Some(tid) => {
-                        let task = state.get(tid);
-                        Ok(Some(task.continuation.clone()))
+                        let task = state.get_mut(tid);
+                        let step = if task.is_async_future() {
+                            NextStep::AsyncPoll {
+                                future_ptr: task.async_future_ptr(),
+                                runner: task.take_async_runner(),
+                            }
+                        } else {
+                            NextStep::Continuation(task.continuation_rc())
+                        };
+                        Ok(Some(step))
                     }
                     ScheduledTask::Finished => {
-                        // The scheduler decided we're finished, so there are either no runnable tasks,
-                        // or all runnable tasks are detached and there are no unfinished attached
-                        // tasks. Therefore, it's a deadlock if there are unfinished attached tasks.
                         if state.tasks.iter().any(|t| !t.finished() && !t.detached) {
                             Err(StepError::Deadlock)
                         } else {
@@ -269,38 +293,98 @@ impl Execution {
                 }
             })?;
 
-            // Run a single step of the chosen task.
-            let ret = match next_step {
-                Some(continuation) => {
+            match next_step {
+                // --- Coroutine-based (thread/block_on) task ---
+                Some(NextStep::Continuation(continuation)) => {
                     Execution::enter_task_span();
-
                     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| continuation.borrow_mut().resume()));
-
                     Execution::exit_task_span();
 
-                    result
-                }
-                None => return Ok(()),
-            };
-
-            match ret {
-                // Task finished
-                Ok(true) => {
-                    crate::annotations::record_task_terminated();
-                    ExecutionState::with(|state| state.current_mut().finish());
-                }
-                // Task yielded
-                Ok(false) => {
-                    // We may have `switch`ed out of the task before we finished unwinding the stack (ie. a `drop` handler calls `switch`).
-                    // If `immediately_return_on_panic` is set, we will then return. If we don't do this, then we run the risk of panicking
-                    // again in some other task, which would result in the test aborting.
-                    if immediately_return_on_panic && std::thread::panicking() {
-                        ExecutionState::with(|state| state.current_task = ScheduledTask::Stopped);
-                        return Err(StepError::TaskPanicEarlyReturn);
+                    match result {
+                        Ok(true) => {
+                            crate::annotations::record_task_terminated();
+                            ExecutionState::with(|state| state.current_mut().finish());
+                        }
+                        Ok(false) => {
+                            // We may have `switch`ed out of the task before we finished unwinding the stack (ie. a `drop` handler calls `switch`).
+                            // If `immediately_return_on_panic` is set, we will then return. If we don't do this, then we run the risk of panicking
+                            // again in some other task, which would result in the test aborting.
+                            if immediately_return_on_panic && std::thread::panicking() {
+                                ExecutionState::with(|state| state.current_task = ScheduledTask::Stopped);
+                                return Err(StepError::TaskPanicEarlyReturn);
+                            }
+                        }
+                        Err(e) => return Err(StepError::TaskFailure(e)),
                     }
                 }
-                // Task failed
-                Err(e) => return Err(StepError::TaskFailure(e)),
+
+                // --- Async future task ---
+                Some(NextStep::AsyncPoll { future_ptr, runner }) => {
+                    // Get or initialize a runner for this poll step.
+                    let runner_rc = if let Some(existing) = runner {
+                        // Resume a runner that was blocked mid-poll.
+                        existing
+                    } else {
+                        // Acquire a fresh runner from the pool and initialize it with a
+                        // single-poll closure. The closure captures future_ptr (valid for the
+                        // whole execution) and polls it once, updating task state on completion.
+                        let mut fresh = ContinuationPool::acquire(stack_size);
+                        fresh.initialize(Box::new(move || {
+                            let waker = ExecutionState::with(|s| s.current_mut().waker());
+                            let cx = &mut Context::from_waker(&waker);
+                            // SAFETY: exclusive access is guaranteed — single-threaded execution,
+                            // and only one runner is active for a given task at a time.
+                            let result = unsafe { &mut *future_ptr }.as_mut().poll(cx);
+                            match result {
+                                Poll::Ready(()) => ExecutionState::with(|s| s.current_mut().finish()),
+                                Poll::Pending => ExecutionState::with(|s| s.current_mut().sleep_unless_woken()),
+                            }
+                        }));
+                        Rc::new(RefCell::new(fresh))
+                    };
+
+                    // Set the async runner yielder so that switch() inside the poll knows to only
+                    // yield on actual blocking, not for interleaving exploration.
+                    let runner_yielder = runner_rc.borrow().yielder;
+                    set_async_runner_yielder(runner_yielder);
+                    Execution::enter_task_span();
+                    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| runner_rc.borrow_mut().resume()));
+                    Execution::exit_task_span();
+                    clear_async_runner_yielder();
+
+                    match result {
+                        Ok(true) => {
+                            // The poll closure ran to completion (Ready or Pending).
+                            // finish() and sleep_unless_woken() were already called inside the closure.
+                            ExecutionState::with(|state| {
+                                if state.current().finished() {
+                                    crate::annotations::record_task_terminated();
+                                }
+                                // If Sleeping: future returned Pending, will be re-polled when waker fires.
+                                // If Runnable: future returned Pending but self-woke (e.g. yield_now),
+                                //   will be re-polled on the next scheduling step.
+                            });
+                            // runner_rc drops here, returning the runner to ContinuationPool.
+                        }
+                        Ok(false) => {
+                            // Runner yielded mid-poll: task is blocked on a sync primitive.
+                            // Store the runner on the task; it will be resumed when the task unblocks.
+                            ExecutionState::with(move |state| {
+                                state.current_mut().set_async_runner(runner_rc);
+                            });
+                            if immediately_return_on_panic && std::thread::panicking() {
+                                ExecutionState::with(|state| state.current_task = ScheduledTask::Stopped);
+                                return Err(StepError::TaskPanicEarlyReturn);
+                            }
+                        }
+                        Err(e) => {
+                            // runner_rc drops here, force_unwind cleans up the coroutine stack.
+                            return Err(StepError::TaskFailure(e));
+                        }
+                    }
+                }
+
+                None => return Ok(()),
             }
         }
     }
@@ -550,7 +634,6 @@ impl ExecutionState {
     /// if it wants to give the new task a chance to run immediately.
     pub(crate) fn spawn_future<F>(
         future: F,
-        stack_size: usize,
         name: Option<String>,
         caller: &'static Location<'static>,
     ) -> TaskId
@@ -572,7 +655,6 @@ impl ExecutionState {
 
             let task = Task::from_future(
                 future,
-                stack_size,
                 task_id,
                 name,
                 clock.clone(),
@@ -655,9 +737,20 @@ impl ExecutionState {
                 final_state == ScheduledTask::Stopped || task.finished() || task.detached,
                 "execution finished but task is not"
             );
-            Rc::try_unwrap(task.continuation)
-                .map_err(|_| ())
-                .expect("couldn't cleanup a future");
+            match task.body {
+                TaskBody::Continuation { inner, .. } => {
+                    Rc::try_unwrap(inner)
+                        .map_err(|_| ())
+                        .expect("couldn't cleanup a continuation");
+                }
+                TaskBody::AsyncFuture { future, runner } => {
+                    // Drop any in-flight runner first (force_unwind will clean up its stack).
+                    drop(runner);
+                    Rc::try_unwrap(future)
+                        .map_err(|_| ())
+                        .expect("couldn't cleanup an async future");
+                }
+            }
         }
 
         while Self::with(|state| state.storage.pop()).is_some() {}
@@ -726,6 +819,9 @@ impl ExecutionState {
     pub(crate) fn should_stop() -> bool {
         std::thread::panicking()
             || Self::with(|s| {
+                if s.in_cleanup {
+                    return true;
+                }
                 assert_ne!(s.current_task, ScheduledTask::Finished);
                 s.current_task == ScheduledTask::Stopped
             })
@@ -780,6 +876,10 @@ impl ExecutionState {
 
     pub(crate) fn in_cleanup(&self) -> bool {
         self.in_cleanup
+    }
+
+    pub(crate) fn has_yielded(&self) -> bool {
+        self.has_yielded
     }
 
     pub(crate) fn context_switches() -> usize {

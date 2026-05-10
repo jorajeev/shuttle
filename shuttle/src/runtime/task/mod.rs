@@ -1,10 +1,9 @@
 use crate::backtrace_enabled;
 use crate::current::get_name_for_task;
-use crate::runtime::execution::{ExecutionState, TASK_ID_TO_TAGS};
+use crate::runtime::execution::TASK_ID_TO_TAGS;
 use crate::runtime::storage::{AlreadyDestructedError, StorageKey, StorageMap};
 use crate::runtime::task::clock::VectorClock;
 use crate::runtime::task::labels::Labels;
-use crate::runtime::thread;
 use crate::runtime::thread::continuation::{
     ContinuationInput, ContinuationOutput, ContinuationPool, PooledContinuation,
 };
@@ -14,15 +13,16 @@ use bitvec::prelude::*;
 use corosensei::Yielder;
 use std::any::Any;
 use std::backtrace::Backtrace;
-use std::cell::RefCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{self, Debug};
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::panic::Location;
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::task::{Context, Waker};
+use std::task::Waker;
 use tracing::{error_span, event, field, Level, Span};
 
 pub(crate) mod clock;
@@ -255,6 +255,38 @@ impl PartialEq for TaskSignature {
 
 impl Eq for TaskSignature {}
 
+/// The execution body of a task: either a coroutine-based continuation or a directly-polled future.
+pub(super) enum TaskBody {
+    /// Coroutine-based execution (thread tasks and block_on). The closure runs inside a
+    /// PooledContinuation, which can suspend at any sync primitive boundary via switch().
+    Continuation {
+        inner: Rc<RefCell<PooledContinuation>>,
+        yielder: *const Yielder<ContinuationInput, ContinuationOutput>,
+    },
+    /// Async future task. The future is stored directly and polled via a shared runner coroutine
+    /// from ContinuationPool. switch() only yields when the task is actually blocked, not for
+    /// interleaving exploration.
+    AsyncFuture {
+        /// The future to poll, wrapped in UnsafeCell to allow raw-pointer access across the
+        /// coroutine boundary without holding a RefMut across yields.
+        future: Rc<UnsafeCell<Pin<Box<dyn Future<Output = ()>>>>>,
+        /// A runner coroutine currently blocked mid-poll, or None if the future is idle.
+        runner: Option<Rc<RefCell<PooledContinuation>>>,
+    },
+}
+
+impl fmt::Debug for TaskBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TaskBody::Continuation { inner, .. } => f.debug_struct("Continuation").field("inner", inner).finish(),
+            TaskBody::AsyncFuture { runner, .. } => f
+                .debug_struct("AsyncFuture")
+                .field("runner_active", &runner.is_some())
+                .finish(),
+        }
+    }
+}
+
 /// A `Task` represents a user-level unit of concurrency. Each task has an `id` that is unique within
 /// the execution, and a `state` reflecting whether the task is runnable (enabled) or not.
 #[derive(Debug)]
@@ -265,8 +297,7 @@ pub struct Task {
     pub(super) detached: bool,
     park_state: ParkState,
 
-    pub(super) continuation: Rc<RefCell<PooledContinuation>>,
-    pub(super) yielder: *const Yielder<ContinuationInput, ContinuationOutput>,
+    pub(super) body: TaskBody,
 
     pub(crate) clock: VectorClock,
 
@@ -332,7 +363,7 @@ impl Task {
         continuation.initialize(f);
         let yielder = continuation.yielder;
         let waker = make_waker(id);
-        let continuation = Rc::new(RefCell::new(continuation));
+        let inner = Rc::new(RefCell::new(continuation));
 
         let step_span =
             error_span!(parent: parent_span_id.clone(), "step", task = format!("{:?}", id), i = field::Empty);
@@ -345,8 +376,7 @@ impl Task {
             id,
             parent_task_id,
             state: TaskState::Runnable,
-            continuation,
-            yielder,
+            body: TaskBody::Continuation { inner, yielder },
             clock,
             waiter: None,
             waker,
@@ -404,7 +434,6 @@ impl Task {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_future<F>(
         future: F,
-        stack_size: usize,
         id: TaskId,
         name: Option<String>,
         clock: VectorClock,
@@ -417,27 +446,94 @@ impl Task {
     where
         F: Future<Output = ()> + 'static,
     {
-        let mut future = Box::pin(future);
+        #[cfg(all(any(test, feature = "vector-clocks"), not(feature = "bench-no-vector-clocks")))]
+        assert!(id.0 < clock.time.len());
 
-        Self::new(
-            Box::new(move || {
-                let waker = ExecutionState::with(|state| state.current_mut().waker());
-                let cx = &mut Context::from_waker(&waker);
-                while future.as_mut().poll(cx).is_pending() {
-                    ExecutionState::with(|state| state.current_mut().sleep_unless_woken());
-                    thread::switch();
-                }
-            }),
-            stack_size,
+        let future_cell = Rc::new(UnsafeCell::new(Box::pin(future) as Pin<Box<dyn Future<Output = ()>>>));
+        let waker = make_waker(id);
+
+        let step_span =
+            error_span!(parent: parent_span_id.clone(), "step", task = format!("{:?}", id), i = field::Empty);
+        let span_stack = vec![step_span.clone()];
+
+        let mut task = Self {
             id,
-            name,
-            clock,
-            parent_span_id,
-            schedule_len,
-            tag,
             parent_task_id,
+            state: TaskState::Runnable,
+            body: TaskBody::AsyncFuture { future: future_cell, runner: None },
+            clock,
+            waiter: None,
+            waker,
+            woken: false,
+            detached: false,
+            park_state: ParkState::default(),
+            name,
+            step_span,
+            span_stack,
+            local_storage: StorageMap::new(),
+            tag: None,
+            backtrace: None,
             signature,
-        )
+        };
+
+        if let Some(tag) = tag {
+            task.set_tag(tag);
+        }
+
+        error_span!(parent: parent_span_id, "new_task", parent = ?parent_task_id, i = schedule_len).in_scope(
+            || event!(Level::DEBUG, task_id = ?task.id, signature = task.signature.signature_hash(), static_create_location = task.signature.static_create_location_hash(), "created task"),
+        );
+
+        task
+    }
+
+    /// Returns the yielder for a continuation-based task. Panics for async future tasks.
+    pub(crate) fn continuation_yielder(&self) -> *const Yielder<ContinuationInput, ContinuationOutput> {
+        match &self.body {
+            TaskBody::Continuation { yielder, .. } => *yielder,
+            TaskBody::AsyncFuture { .. } => panic!("async future task has no continuation yielder"),
+        }
+    }
+
+    /// Returns the continuation Rc for a continuation-based task. Panics for async future tasks.
+    pub(crate) fn continuation_rc(&self) -> Rc<RefCell<PooledContinuation>> {
+        match &self.body {
+            TaskBody::Continuation { inner, .. } => inner.clone(),
+            TaskBody::AsyncFuture { .. } => panic!("async future task has no continuation"),
+        }
+    }
+
+    /// Returns true if this task is an async future task (driven by the async runner mechanism).
+    pub(crate) fn is_async_future(&self) -> bool {
+        matches!(self.body, TaskBody::AsyncFuture { .. })
+    }
+
+    /// Returns a raw pointer to the future for an async future task. Panics for continuation tasks.
+    ///
+    /// Safety: the caller must ensure exclusive access to the future during the poll (guaranteed
+    /// by the single-threaded execution model and the fact that only one runner executes at a time).
+    pub(crate) fn async_future_ptr(&self) -> *mut Pin<Box<dyn Future<Output = ()>>> {
+        match &self.body {
+            TaskBody::AsyncFuture { future, .. } => future.get(),
+            TaskBody::Continuation { .. } => panic!("continuation task has no async future"),
+        }
+    }
+
+    /// Takes the in-flight runner out of an async future task, leaving None. Returns None if
+    /// no runner is currently blocked mid-poll.
+    pub(crate) fn take_async_runner(&mut self) -> Option<Rc<RefCell<PooledContinuation>>> {
+        match &mut self.body {
+            TaskBody::AsyncFuture { runner, .. } => runner.take(),
+            TaskBody::Continuation { .. } => panic!("continuation task has no async runner"),
+        }
+    }
+
+    /// Stores a runner on an async future task (task is blocked mid-poll).
+    pub(crate) fn set_async_runner(&mut self, r: Rc<RefCell<PooledContinuation>>) {
+        match &mut self.body {
+            TaskBody::AsyncFuture { runner, .. } => *runner = Some(r),
+            TaskBody::Continuation { .. } => panic!("continuation task has no async runner"),
+        }
     }
 
     /// Returns the identifier of this task.

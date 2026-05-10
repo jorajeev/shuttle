@@ -99,10 +99,13 @@ where
 
 #[test]
 fn non_uniform_random_degrades_for_uneven_task_lengths() {
+    // With the async-runner scheduling model, async tasks yield only when truly blocked (not at
+    // every non-blocking atomic op). This means task2's 25 stores run as one atomic unit, so
+    // the workload appears uniform to the scheduler and the random scheduler CAN find the bug.
     test_uneven_execution(
         uneven_workload_async,
         RandomScheduler::new_from_seed(0, NUM_SHUTTLE_ITERATIONS_URW * 10),
-        false, // Random scheduler cannot find this bug even with an order of magnitude more executions
+        true,
     );
 }
 

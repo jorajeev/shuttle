@@ -25,12 +25,10 @@ where
     F: Future + 'static,
     F::Output: 'static,
 {
-    let stack_size = ExecutionState::with(|s| s.config.stack_size);
     let inner = Arc::new(std::sync::Mutex::new(JoinHandleInner::default()));
     let aborted = Arc::new(AtomicBool::new(false));
     let task_id = ExecutionState::spawn_future(
         Wrapper::new(fut, inner.clone(), aborted.clone()),
-        stack_size,
         None,
         caller,
     );

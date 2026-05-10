@@ -11,6 +11,22 @@ use std::panic::Location;
 use std::rc::Rc;
 use tracing::trace;
 
+thread_local! {
+    /// Set to the yielder of the async runner coroutine currently executing, or null if no async
+    /// runner is active. Used by switch() to know it is inside an async runner and should only
+    /// yield when the task is actually blocked, not for interleaving exploration.
+    static ASYNC_RUNNER_YIELDER: Cell<*const Yielder<ContinuationInput, ContinuationOutput>> =
+        const { Cell::new(std::ptr::null()) };
+}
+
+pub(crate) fn set_async_runner_yielder(yielder: *const Yielder<ContinuationInput, ContinuationOutput>) {
+    ASYNC_RUNNER_YIELDER.with(|c| c.set(yielder));
+}
+
+pub(crate) fn clear_async_runner_yielder() {
+    ASYNC_RUNNER_YIELDER.with(|c| c.set(std::ptr::null()));
+}
+
 scoped_thread_local! {
     pub(crate) static CONTINUATION_POOL: ContinuationPool
 }
@@ -331,8 +347,28 @@ unsafe impl Send for PooledContinuation {}
 pub(crate) fn switch() {
     crate::annotations::record_tick();
     trace!("switch from {}", Location::caller());
+
+    let async_yielder = ASYNC_RUNNER_YIELDER.with(|c| c.get());
+    if !async_yielder.is_null() {
+        // Inside an async runner. Only yield when the task is actually blocked — skip
+        // interleaving-exploration yields entirely.
+        let should_yield = ExecutionState::with(|state| {
+            let task = state.current();
+            task.sleeping() || task.blocked() || state.has_yielded()
+        });
+        if should_yield {
+            // SAFETY: yielder is valid for the lifetime of the runner coroutine, which outlives
+            // this call (the runner is held alive by the Rc on the task or the main loop).
+            match unsafe { &(*async_yielder) }.suspend(ContinuationOutput::Yielded) {
+                ContinuationInput::Exit => panic!("unexpected exit in async runner"),
+                ContinuationInput::Resume => {}
+            }
+        }
+        return;
+    }
+
     if ExecutionState::maybe_yield() {
-        let yielder = ExecutionState::with(|state| state.current().yielder);
+        let yielder = ExecutionState::with(|state| state.current().continuation_yielder());
 
         // SAFETY: A yielder reference will be valid for the lifetime of the continuation (see `corosensei::Coroutine::with_stack`)
         // The yielder field is stored on the Task, whose lifetime is necessarily subsumed by the lifetime of the continuation which contains it.
