@@ -9,7 +9,7 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::panic::Location;
 use std::rc::Rc;
-use tracing::trace;
+use tracing::{info, trace};
 
 thread_local! {
     /// Set to the yielder of the async runner coroutine currently executing, or null if no async
@@ -224,12 +224,16 @@ impl Drop for Continuation {
 pub(crate) struct ContinuationPool {
     // invariant: if c is in this queue, c.reusable() == true
     continuations: Rc<RefCell<VecDeque<Continuation>>>,
+    reuses: Cell<usize>,
+    creations: Cell<usize>,
 }
 
 impl ContinuationPool {
     pub fn new() -> Self {
         Self {
             continuations: Rc::new(RefCell::new(VecDeque::new())),
+            reuses: Cell::new(0),
+            creations: Cell::new(0),
         }
     }
 
@@ -241,16 +245,30 @@ impl ContinuationPool {
     fn acquire_inner(&self, stack_size: usize) -> PooledContinuation {
         // TODO add a check to ensure that if we recycled a continuation, its
         // TODO allocated stack size is at least the requested `stack_size`
-        let continuation = self
-            .continuations
-            .borrow_mut()
-            .pop_front()
-            .unwrap_or_else(move || Continuation::new(stack_size));
+        let continuation = if let Some(c) = self.continuations.borrow_mut().pop_front() {
+            self.reuses.set(self.reuses.get() + 1);
+            c
+        } else {
+            self.creations.set(self.creations.get() + 1);
+            Continuation::new(stack_size)
+        };
 
         PooledContinuation {
             continuation: Some(continuation),
             queue: self.continuations.clone(),
         }
+    }
+}
+
+impl Drop for ContinuationPool {
+    fn drop(&mut self) {
+        let reuses = self.reuses.get();
+        let creations = self.creations.get();
+        info!(
+            coroutine_creations = creations,
+            coroutine_reuses = reuses,
+            "continuation pool stats"
+        );
     }
 }
 
