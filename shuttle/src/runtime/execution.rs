@@ -263,6 +263,11 @@ impl Execution {
             },
         }
 
+        // The active runner for async polls. Held across loop iterations to avoid pool round-trips.
+        // When a poll completes normally, we keep the runner here for the next async poll.
+        // When a poll blocks mid-way, we park the runner on the task and allocate a fresh one.
+        let mut active_runner: Option<Rc<RefCell<PooledContinuation>>> = None;
+
         loop {
             let next_step: Option<NextStep> = ExecutionState::with(|state| {
                 state.schedule()?;
@@ -325,11 +330,11 @@ impl Execution {
                         // Resume a runner that was blocked mid-poll.
                         existing
                     } else {
-                        // Acquire a fresh runner from the pool and initialize it with a
-                        // single-poll closure. The closure captures future_ptr (valid for the
-                        // whole execution) and polls it once, updating task state on completion.
-                        let mut fresh = ContinuationPool::acquire(stack_size);
-                        fresh.initialize(Box::new(move || {
+                        // Reuse the active runner or acquire a fresh one from the pool.
+                        let rc = active_runner.take().unwrap_or_else(|| {
+                            Rc::new(RefCell::new(ContinuationPool::acquire(stack_size)))
+                        });
+                        rc.borrow_mut().initialize(Box::new(move || {
                             let waker = ExecutionState::with(|s| s.current_mut().waker());
                             let cx = &mut Context::from_waker(&waker);
                             // SAFETY: exclusive access is guaranteed — single-threaded execution,
@@ -340,7 +345,7 @@ impl Execution {
                                 Poll::Pending => ExecutionState::with(|s| s.current_mut().sleep_unless_woken()),
                             }
                         }));
-                        Rc::new(RefCell::new(fresh))
+                        rc
                     };
 
                     // Set the async runner yielder so that switch() inside the poll knows to only
@@ -360,11 +365,9 @@ impl Execution {
                                 if state.current().finished() {
                                     crate::annotations::record_task_terminated();
                                 }
-                                // If Sleeping: future returned Pending, will be re-polled when waker fires.
-                                // If Runnable: future returned Pending but self-woke (e.g. yield_now),
-                                //   will be re-polled on the next scheduling step.
                             });
-                            // runner_rc drops here, returning the runner to ContinuationPool.
+                            // Keep the runner for the next async poll instead of returning to pool.
+                            active_runner = Some(runner_rc);
                         }
                         Ok(false) => {
                             // Runner yielded mid-poll: task is blocked on a sync primitive.
