@@ -47,6 +47,11 @@ pub struct Config {
 
     /// The config to define how to handle ungraceful shutdowns, ie. when the test panics.
     pub ungraceful_shutdown_config: UngracefulShutdownConfig,
+
+    /// Metrics collection configuration.
+    /// Requires the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    pub metrics: Option<crate::metrics::MetricsConfig>,
 }
 
 std::thread_local! {
@@ -125,7 +130,18 @@ impl Config {
             silence_warnings: false,
             record_steps_in_span: false,
             ungraceful_shutdown_config: UngracefulShutdownConfig::default(),
+            #[cfg(feature = "metrics")]
+            metrics: None,
         }
+    }
+
+    /// Enable metrics collection.
+    ///
+    /// Requires the `metrics` feature.
+    #[cfg(feature = "metrics")]
+    pub fn with_metrics(mut self, config: crate::metrics::MetricsConfig) -> Self {
+        self.metrics = Some(config);
+        self
     }
 }
 

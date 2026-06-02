@@ -144,6 +144,13 @@ impl Execution {
     where
         F: FnOnce() + Send + 'static,
     {
+        #[cfg(feature = "metrics")]
+        {
+            let record_task_metrics = config.metrics.as_ref().is_some_and(|m| m.record_task_metrics);
+            let record_step_trace = config.metrics.as_ref().is_some_and(|m| m.record_step_trace);
+            crate::metrics::RunMetrics::reset(record_task_metrics, record_step_trace);
+        }
+
         let state = RefCell::new(ExecutionState::new(config.clone(), Rc::clone(&self.scheduler)));
 
         init_panic_hook(config.clone());
@@ -553,6 +560,16 @@ impl ExecutionState {
             task_id
         });
         crate::annotations::record_task_created(task_id, false);
+        #[cfg(feature = "metrics")]
+        {
+            let sig = TaskSignature::new_parentless(caller);
+            crate::metrics::RunMetrics::register_task(
+                task_id.0, sig.signature_hash(), caller.file(), caller.line(), 0,
+            );
+            crate::metrics::StepTrace::record_event(
+                crate::metrics::TraceEvent::Spawn, task_id.0 as u16,
+            );
+        }
         task_id
     }
 
@@ -600,6 +617,17 @@ impl ExecutionState {
             task_id
         });
         crate::annotations::record_task_created(task_id, true);
+        #[cfg(feature = "metrics")]
+        Self::with(|state| {
+            let sig_hash = state.tasks[task_id.0].signature.signature_hash();
+            let parent_hash = state.current().signature.signature_hash();
+            crate::metrics::RunMetrics::register_task(
+                task_id.0, sig_hash, caller.file(), caller.line(), parent_hash,
+            );
+            crate::metrics::StepTrace::record_event(
+                crate::metrics::TraceEvent::Spawn, task_id.0 as u16,
+            );
+        });
         task_id
     }
 
@@ -646,6 +674,17 @@ impl ExecutionState {
             task_id
         });
         crate::annotations::record_task_created(task_id, false);
+        #[cfg(feature = "metrics")]
+        Self::with(|state| {
+            let sig_hash = state.tasks[task_id.0].signature.signature_hash();
+            let parent_hash = state.current().signature.signature_hash();
+            crate::metrics::RunMetrics::register_task(
+                task_id.0, sig_hash, caller.file(), caller.line(), parent_hash,
+            );
+            crate::metrics::StepTrace::record_event(
+                crate::metrics::TraceEvent::Spawn, task_id.0 as u16,
+            );
+        });
         task_id
     }
 
@@ -760,6 +799,8 @@ impl ExecutionState {
     /// Generate a random u64 from the current scheduler and return it.
     #[inline]
     pub fn next_u64() -> u64 {
+        #[cfg(feature = "metrics")]
+        crate::metrics::RunMetrics::with_current(|m| m.random_choices += 1);
         Self::with(|state| {
             CurrentSchedule::push_random();
             state.scheduler.borrow_mut().next_u64()
@@ -927,6 +968,39 @@ impl ExecutionState {
             .map(ScheduledTask::Some)
             .unwrap_or(ScheduledTask::Stopped);
 
+        #[cfg(feature = "metrics")]
+        {
+            let num_runnable = task_refs.len() as u64;
+            let num_live = self.tasks.iter().filter(|t| !t.finished()).count() as u64;
+            crate::metrics::RunMetrics::with_current(|m| {
+                m.scheduler_decisions += 1;
+                if num_runnable > m.max_runnable_tasks {
+                    m.max_runnable_tasks = num_runnable;
+                }
+                if num_live > m.max_live_tasks {
+                    m.max_live_tasks = num_live;
+                }
+                if is_yielding {
+                    m.task_yields += 1;
+                }
+                if let Some(ref mut per_task) = m.per_task {
+                    for &t in task_refs {
+                        if let Some(tm) = per_task.get_mut(t.id().0) {
+                            tm.times_in_runnable_set += 1;
+                        }
+                    }
+                    if let Some(chosen_id) = self.next_task.id() {
+                        if let Some(tm) = per_task.get_mut(chosen_id.0) {
+                            tm.times_scheduled += 1;
+                        }
+                    }
+                }
+            });
+            if let Some(chosen_id) = self.next_task.id() {
+                crate::metrics::StepTrace::record_choice(chosen_id.0 as u16);
+            }
+        }
+
         // Tracing this `in_scope` is purely a matter of taste. We do it because
         // 1) It is an action taken by the scheduler, and should thus be traced under the scheduler's span
         // 2) It creates a visual separation of scheduling decisions and `Task`-induced tracing.
@@ -964,7 +1038,16 @@ impl ExecutionState {
     /// Set the next task as the current task
     fn advance_to_next_task(&mut self) {
         debug_assert_ne!(self.next_task, ScheduledTask::None);
+
+        #[cfg(feature = "metrics")]
+        let prev = self.current_task;
+
         self.current_task = self.next_task.take();
+
+        #[cfg(feature = "metrics")]
+        if self.current_task.id() != prev.id() {
+            crate::metrics::RunMetrics::with_current(|m| m.context_switches += 1);
+        }
 
         if let ScheduledTask::Some(tid) = self.current_task {
             CurrentSchedule::push_task(tid);

@@ -6,6 +6,8 @@ pub mod config;
 pub mod current;
 pub mod future;
 pub mod hint;
+#[cfg(feature = "metrics")]
+pub mod metrics;
 pub mod runtime;
 pub mod scheduler;
 pub mod sync_types;

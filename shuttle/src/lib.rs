@@ -184,6 +184,8 @@
 pub use shuttle_core::annotations;
 pub use shuttle_core::current;
 pub use shuttle_core::hint;
+#[cfg(feature = "metrics")]
+pub use shuttle_core::metrics;
 
 pub mod future;
 pub mod lazy_static;

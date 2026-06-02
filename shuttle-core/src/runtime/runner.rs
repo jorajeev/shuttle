@@ -55,6 +55,8 @@ impl Drop for ResetSpanOnDrop {
 pub struct Runner<S: ?Sized + Scheduler> {
     scheduler: Rc<RefCell<MetricsScheduler<S>>>,
     config: Config,
+    #[cfg(feature = "metrics")]
+    metrics_writer: Option<crate::metrics::MetricsWriter>,
 }
 
 impl<S: Scheduler + 'static> Runner<S> {
@@ -62,16 +64,26 @@ impl<S: Scheduler + 'static> Runner<S> {
     pub fn new(scheduler: S, config: Config) -> Self {
         let metrics_scheduler = MetricsScheduler::new(scheduler);
 
+        #[cfg(feature = "metrics")]
+        let metrics_writer = config.metrics.as_ref().and_then(|mc| {
+            crate::metrics::MetricsWriter::new(mc)
+                .map_err(|e| eprintln!("shuttle: failed to open metrics file: {e}"))
+                .ok()
+        });
+
         Self {
             scheduler: Rc::new(RefCell::new(metrics_scheduler)),
             config,
+            #[cfg(feature = "metrics")]
+            metrics_writer,
         }
     }
 
     /// Test the given function and return the number of times the function was invoked during the
     /// test (i.e., the number of iterations run).
     #[track_caller]
-    pub fn run<F>(self, f: F) -> usize
+    #[cfg_attr(not(feature = "metrics"), allow(unused_mut))]
+    pub fn run<F>(mut self, f: F) -> usize
     where
         F: Fn() + Send + Sync + 'static,
     {
@@ -83,6 +95,10 @@ impl<S: Scheduler + 'static> Runner<S> {
             let f = Arc::new(f);
 
             let start = Instant::now();
+
+            #[cfg(feature = "metrics")]
+            let mut task_aggregates: std::collections::HashMap<u64, crate::metrics::TaskAggregate> =
+                std::collections::HashMap::new();
 
             let mut i = 0;
 
@@ -96,6 +112,11 @@ impl<S: Scheduler + 'static> Runner<S> {
                     Some(s) => s,
                 };
 
+                #[cfg(feature = "metrics")]
+                let seed = schedule.seed;
+                #[cfg(feature = "metrics")]
+                let run_start = Instant::now();
+
                 let execution = Execution::new(self.scheduler.clone(), schedule);
                 let f = Arc::clone(&f);
 
@@ -107,8 +128,52 @@ impl<S: Scheduler + 'static> Runner<S> {
                 span!(Level::ERROR, "execution", i)
                     .in_scope(|| execution.run(&self.config, move || f(), Location::caller()));
 
+                #[cfg(feature = "metrics")]
+                if let Some(ref mut writer) = self.metrics_writer {
+                    use crate::runtime::execution::CurrentSchedule;
+
+                    let wall_time_ns = run_start.elapsed().as_nanos() as u64;
+                    let schedule_len = CurrentSchedule::len() as u64;
+                    let metrics = crate::metrics::RunMetrics::snapshot();
+                    if let Err(e) = writer.write_run_summary(seed, wall_time_ns, schedule_len, &metrics) {
+                        eprintln!("shuttle: failed to write metrics: {e}");
+                    }
+                    if writer.record_task_metrics() {
+                        if let Some(ref per_task) = metrics.per_task {
+                            writer.collect_task_signatures(per_task, &metrics.task_locations);
+                            for t in per_task {
+                                let agg = task_aggregates.entry(t.signature_hash).or_default();
+                                agg.total_scheduled += t.times_scheduled;
+                                agg.total_runnable += t.times_in_runnable_set;
+                                agg.runs_seen += 1;
+                            }
+                        }
+                    }
+                    if writer.record_step_trace() {
+                        if let Some(trace) = crate::metrics::StepTrace::take() {
+                            if let Err(e) = writer.write_trace(seed, &trace) {
+                                eprintln!("shuttle: failed to write trace: {e}");
+                            }
+                        }
+                    }
+                }
+
                 i += 1;
             }
+
+            #[cfg(feature = "metrics")]
+            if let Some(ref writer) = self.metrics_writer {
+                let total_wall_time_ns = start.elapsed().as_nanos();
+                let aggregates = if writer.record_task_metrics() {
+                    Some(&task_aggregates)
+                } else {
+                    None
+                };
+                if let Err(e) = writer.write_manifest(total_wall_time_ns, aggregates) {
+                    eprintln!("shuttle: failed to write manifest: {e}");
+                }
+            }
+
             i
         })
     }

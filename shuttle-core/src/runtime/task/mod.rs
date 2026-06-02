@@ -505,6 +505,11 @@ impl Task {
 
         assert!(self.state != TaskState::Finished);
         self.state = TaskState::Blocked { allow_spurious_wakeups };
+        #[cfg(feature = "metrics")]
+        {
+            crate::metrics::RunMetrics::with_current(|m| m.task_blocks += 1);
+            crate::metrics::StepTrace::record_event(crate::metrics::TraceEvent::Block, self.id.0 as u16);
+        }
     }
 
     pub fn sleep(&mut self) {
@@ -516,12 +521,22 @@ impl Task {
 
         assert!(self.state != TaskState::Finished);
         self.state = TaskState::Sleeping;
+        #[cfg(feature = "metrics")]
+        {
+            crate::metrics::RunMetrics::with_current(|m| m.task_blocks += 1);
+            crate::metrics::StepTrace::record_event(crate::metrics::TraceEvent::Block, self.id.0 as u16);
+        }
     }
 
     pub fn unblock(&mut self) {
         // Note we don't assert the task is blocked here. For example, a task invoking its own waker
         // will not be blocked when this is called.
         assert!(self.state != TaskState::Finished);
+        #[cfg(feature = "metrics")]
+        if self.state != TaskState::Runnable {
+            crate::metrics::RunMetrics::with_current(|m| m.task_unblocks += 1);
+            crate::metrics::StepTrace::record_event(crate::metrics::TraceEvent::Unblock, self.id.0 as u16);
+        }
         self.state = TaskState::Runnable;
 
         // When a task gets unblocked, it's definitely no longer blocked in a call to `park`. This
@@ -534,6 +549,11 @@ impl Task {
     pub fn finish(&mut self) {
         assert!(self.state != TaskState::Finished);
         self.state = TaskState::Finished;
+        #[cfg(feature = "metrics")]
+        {
+            crate::metrics::RunMetrics::with_current(|m| m.task_completions += 1);
+            crate::metrics::StepTrace::record_event(crate::metrics::TraceEvent::Finish, self.id.0 as u16);
+        }
     }
 
     /// Potentially put this task to sleep after it was polled by the executor, unless someone has

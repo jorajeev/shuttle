@@ -33,4 +33,5 @@ proptest = "1.0.0"
 default = []
 vector-clocks = []
 annotation = ["dep:serde", "dep:serde_json", "dep:regex"]
+metrics = []
 bench-no-vector-clocks = []
