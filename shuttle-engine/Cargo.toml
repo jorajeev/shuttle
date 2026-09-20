@@ -32,7 +32,6 @@ proptest = "1.0.0"
 [features]
 default = []
 vector-clocks = []
-causal-state = []
 # Annotated schedules record each task's vector clock so that Shuttle Explorer can
 # show causal dependence between tasks, so `annotation` implies `vector-clocks`.
 annotation = ["vector-clocks", "dep:serde", "dep:serde_json", "dep:regex"]

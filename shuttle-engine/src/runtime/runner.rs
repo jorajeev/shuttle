@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::runtime::causality::initialize_global_causal_state;
 use crate::runtime::execution::Execution;
 use crate::runtime::task::{Task, TaskId};
 use crate::runtime::thread::continuation::{ContinuationPool, CONTINUATION_POOL};
@@ -60,6 +61,7 @@ pub struct Runner<S: ?Sized + Scheduler> {
 impl<S: Scheduler + 'static> Runner<S> {
     /// Construct a new `Runner` that will use the given `Scheduler` to control the test.
     pub fn new(scheduler: S, config: Config) -> Self {
+        initialize_global_causal_state(config.causal_state.is_enabled());
         let metrics_scheduler = MetricsScheduler::new(scheduler);
 
         Self {
@@ -128,6 +130,7 @@ impl PortfolioRunner {
     /// all schedulers will be terminated as soon as any fails; if false, they will keep running
     /// and potentially find multiple bugs.
     pub fn new(stop_on_first_failure: bool, config: Config) -> Self {
+        initialize_global_causal_state(config.causal_state.is_enabled());
         Self {
             schedulers: Vec::new(),
             stop_on_first_failure,

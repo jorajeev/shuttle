@@ -1,6 +1,6 @@
 //! Shuttle's implementation of [`std::thread`].
 
-use shuttle_engine::runtime::causality::CausalSnapshot;
+use shuttle_engine::runtime::causality::ApplicationStateSnapshot;
 use shuttle_engine::runtime::execution::ExecutionState;
 use shuttle_engine::runtime::task::TaskId;
 use shuttle_engine::runtime::thread;
@@ -58,7 +58,7 @@ impl Thread {
 pub struct Scope<'scope, 'env: 'scope> {
     num_running_threads: AtomicUsize,
     main_task: TaskId,
-    child_tasks: std::sync::Mutex<Vec<TaskId>>,
+    child_tasks: Option<std::sync::Mutex<Vec<TaskId>>>,
     scope: PhantomData<&'scope mut &'scope ()>,
     env: PhantomData<&'env mut &'env ()>,
 }
@@ -116,7 +116,9 @@ impl<'scope> Scope<'scope, '_> {
             finished,
             _marker: PhantomData,
         };
-        self.child_tasks.lock().unwrap().push(handle.handle.task_id);
+        if let Some(child_tasks) = &self.child_tasks {
+            child_tasks.lock().unwrap().push(handle.handle.task_id);
+        }
         handle
     }
 }
@@ -132,7 +134,7 @@ where
     let scope = Scope {
         num_running_threads: AtomicUsize::new(0),
         main_task: ExecutionState::with(|s| s.current().id()),
-        child_tasks: std::sync::Mutex::new(Vec::new()),
+        child_tasks: shuttle_engine::current::causal::enabled().then(|| std::sync::Mutex::new(Vec::new())),
         env: PhantomData,
         scope: PhantomData,
     };
@@ -145,15 +147,18 @@ where
         thread::switch();
     }
 
-    let child_tasks = scope.child_tasks.lock().unwrap().clone();
-    if !child_tasks.is_empty() {
-        ExecutionState::with(|state| {
-            let mut completed = CausalSnapshot::new();
-            for task_id in child_tasks {
-                completed.update(&state.get_causality(task_id));
-            }
-            state.update_causality(&completed);
-        });
+    if let Some(child_tasks) = &scope.child_tasks {
+        let child_tasks = child_tasks.lock().unwrap().clone();
+        if !child_tasks.is_empty() {
+            ExecutionState::with(|state| {
+                let mut completed = ApplicationStateSnapshot::new();
+                for task_id in child_tasks {
+                    completed.update(&state.get_application_causality(task_id));
+                }
+                let current = state.current().id();
+                state.join_application_causality_for_task(current, &completed);
+            });
+        }
     }
 
     ret

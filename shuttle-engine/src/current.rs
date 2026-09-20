@@ -53,6 +53,7 @@ pub fn clock_for(task_id: TaskId) -> VectorClock {
 pub mod causal {
     use crate::runtime::execution::ExecutionState;
 
+    pub use crate::runtime::causality::ApplicationStateSnapshot;
     /// An opaque snapshot containing vector-clock and application-defined
     /// causal state.
     pub use crate::runtime::causality::CausalSnapshot as Snapshot;
@@ -73,6 +74,37 @@ pub mod causal {
         ExecutionState::with(|state| state.update_causality(snapshot));
     }
 
+    /// Capture only the current task's application-defined causal state.
+    ///
+    /// This operation does not read or advance the current task's vector
+    /// clock, and it does not yield to the scheduler. It is intended for
+    /// synchronization-library implementations that propagate application
+    /// state across an edge that does not propagate Shuttle's vector clocks.
+    pub fn capture_application_state() -> ApplicationStateSnapshot {
+        if !enabled() {
+            return ApplicationStateSnapshot::new();
+        }
+        ExecutionState::with(|state| {
+            let task_id = state.current().id();
+            state.get_application_causality(task_id)
+        })
+    }
+
+    /// Join only application-defined causal state into the current task.
+    ///
+    /// This operation does not read, advance, or join vector clocks, and it
+    /// does not yield to the scheduler. Snapshots from older executions are
+    /// ignored. It is intended for synchronization-library implementations.
+    pub fn join_application_state(snapshot: &ApplicationStateSnapshot) {
+        if !enabled() {
+            return;
+        }
+        ExecutionState::with(|state| {
+            let task_id = state.current().id();
+            state.join_application_causality_for_task(task_id, snapshot);
+        });
+    }
+
     /// Join a snapshot without advancing the current task's vector clock.
     #[doc(hidden)]
     pub fn join_without_increment(snapshot: &Snapshot) {
@@ -83,7 +115,6 @@ pub mod causal {
     }
 
     /// Get a clone of the application-defined causal state for the current task.
-    #[cfg(feature = "causal-state")]
     pub fn state<T>() -> T
     where
         T: Clone + Send + Sync + 'static,
@@ -97,7 +128,6 @@ pub mod causal {
     /// Join a value into the current task's application-defined causal state.
     ///
     /// The configured join operation must only add information.
-    #[cfg(feature = "causal-state")]
     pub fn join_state<T>(incoming: T)
     where
         T: Clone + Send + Sync + 'static,
@@ -137,6 +167,28 @@ pub mod causal {
         })
         .ok()
         .flatten()
+    }
+
+    /// Try to capture only the current task's application-defined causal
+    /// state.
+    #[doc(hidden)]
+    pub fn try_capture_application_state() -> Option<ApplicationStateSnapshot> {
+        if !enabled() {
+            return None;
+        }
+        ExecutionState::try_with(|state| {
+            let task_id = state.try_current()?.id();
+            Some(state.get_application_causality(task_id))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Whether application-defined causal state is globally enabled.
+    #[doc(hidden)]
+    #[inline]
+    pub fn enabled() -> bool {
+        crate::runtime::causality::causal_state_enabled()
     }
 }
 

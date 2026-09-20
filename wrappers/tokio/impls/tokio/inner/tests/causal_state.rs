@@ -1,4 +1,4 @@
-#![cfg(all(feature = "causal-state", feature = "sync", feature = "rt"))]
+#![cfg(all(feature = "sync", feature = "rt"))]
 
 use shuttle::current::causal;
 use shuttle::future;
@@ -39,7 +39,9 @@ fn oneshot_propagates_send_and_close() {
                 tx.send(()).unwrap();
             });
 
+            let before = shuttle::current::clock();
             rx.await.unwrap();
+            assert_eq!(shuttle::current::clock(), before);
             assert_eq!(bits(), 3);
             child.await.unwrap();
         });
@@ -53,7 +55,9 @@ fn oneshot_propagates_send_and_close() {
                 drop(tx);
             });
 
+            let before = shuttle::current::clock();
             assert!(rx.await.is_err());
+            assert_eq!(shuttle::current::clock(), before);
             assert_eq!(bits(), 3);
             child.await.unwrap();
         });
@@ -74,7 +78,9 @@ fn notify_propagates_waiting_and_stored_notifications() {
                 })
             };
 
+            let before = shuttle::current::clock();
             notified.await;
+            assert_eq!(shuttle::current::clock(), before);
             assert_eq!(bits(), 3);
             child.await.unwrap();
         });
@@ -97,7 +103,9 @@ fn notify_propagates_waiting_and_stored_notifications() {
             while !done.load(Ordering::SeqCst) {
                 future::yield_now().await;
             }
+            let before = shuttle::current::clock();
             notify.notified().await;
+            assert_eq!(shuttle::current::clock(), before);
             assert_eq!(bits(), 3);
             child.await.unwrap();
         });
@@ -114,7 +122,9 @@ fn watch_changed_propagates_changes_and_close() {
                 tx.send(1).unwrap();
             });
 
+            let before = shuttle::current::clock();
             rx.changed().await.unwrap();
+            assert_eq!(shuttle::current::clock(), before);
             assert_eq!(bits(), 3);
             child.await.unwrap();
         });
@@ -128,7 +138,9 @@ fn watch_changed_propagates_changes_and_close() {
                 drop(tx);
             });
 
+            let before = shuttle::current::clock();
             assert!(rx.changed().await.is_err());
+            assert_eq!(shuttle::current::clock(), before);
             assert_eq!(bits(), 3);
             child.await.unwrap();
         });
@@ -145,7 +157,9 @@ fn mpsc_and_semaphore_propagate_close() {
                 drop(tx);
             });
 
+            let before = shuttle::current::clock();
             assert!(rx.recv().await.is_none());
+            assert_eq!(shuttle::current::clock(), before);
             assert_eq!(bits(), 3);
             child.await.unwrap();
         });
@@ -159,7 +173,9 @@ fn mpsc_and_semaphore_propagate_close() {
                 drop(rx);
             });
 
+            let before = shuttle::current::clock();
             tx.closed().await;
+            assert_eq!(shuttle::current::clock(), before);
             assert_eq!(bits(), 3);
             child.await.unwrap();
         });
@@ -176,7 +192,9 @@ fn mpsc_and_semaphore_propagate_close() {
                 })
             };
 
+            let before = shuttle::current::clock();
             assert!(semaphore.acquire().await.is_err());
+            assert_eq!(shuttle::current::clock(), before);
             assert_eq!(bits(), 3);
             child.await.unwrap();
         });

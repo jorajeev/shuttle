@@ -142,12 +142,12 @@ impl Config {
     /// `initial` will usually return the identity for `join`, though it may
     /// include information deliberately given to every task.
     ///
-    /// Only one causal state type may be configured. `join` must be
-    /// deterministic, associative, commutative, idempotent, and must never
-    /// remove information. It must not panic, block, perform I/O, or call
-    /// Shuttle APIs. Cloning a value must provide value semantics: mutating one
-    /// clone must not affect another clone.
-    #[cfg(feature = "causal-state")]
+    /// Only one causal state type may be configured. `initial`, `join`, and
+    /// cloning the state must not panic, block, perform I/O, or call Shuttle
+    /// APIs. `join` must be deterministic, associative, commutative,
+    /// idempotent, and must never remove information. Cloning a value must
+    /// provide value semantics: mutating one clone must not affect another
+    /// clone.
     pub fn with_causal_state<T, I, J>(mut self, initial: I, join: J) -> Self
     where
         T: Clone + Send + Sync + 'static,

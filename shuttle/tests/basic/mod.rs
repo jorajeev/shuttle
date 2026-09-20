@@ -2,8 +2,6 @@
 mod annotation;
 mod atomic;
 mod barrier;
-#[cfg(feature = "causal-state")]
-mod causal_state;
 pub(crate) mod clocks;
 mod condvar;
 mod config;

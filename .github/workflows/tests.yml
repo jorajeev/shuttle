@@ -27,6 +27,10 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: cargo nextest
         run: cargo nextest run --release --workspace
+      - name: Tokio causal state with vector clocks
+        run: cargo nextest run --release -p shuttle-tokio-impl-inner --features sync,rt,vector-clocks --test causal_state
+      - name: Tokio causal state without vector clocks
+        run: cargo nextest run --release -p shuttle-tokio-impl-inner --features sync,rt --test causal_state
       - name: cargo test --doc
         run: cargo test --release --doc --workspace
 
@@ -79,4 +83,3 @@ jobs:
         run: rustup update stable
       - name: cargo doc
         run: cargo doc --no-deps
-

@@ -1,6 +1,5 @@
 use crate::backtrace_enabled;
 use crate::current::get_name_for_task;
-use crate::runtime::causality::CausalStateValue;
 use crate::runtime::execution::{ExecutionState, TASK_ID_TO_TAGS};
 use crate::runtime::storage::{AlreadyDestructedError, StorageKey, StorageMap};
 use crate::runtime::task::clock::VectorClock;
@@ -270,7 +269,6 @@ pub struct Task {
     pub(super) yielder: *const Yielder<ContinuationInput, ContinuationOutput>,
 
     pub clock: VectorClock,
-    pub(crate) causal_state: Option<CausalStateValue>,
 
     waiter: Option<TaskId>,
 
@@ -322,7 +320,6 @@ impl Task {
         id: TaskId,
         name: Option<String>,
         clock: VectorClock,
-        causal_state: Option<CausalStateValue>,
         parent_span_id: Option<tracing::span::Id>,
         schedule_len: usize,
         tag: Option<Arc<dyn Tag>>,
@@ -351,7 +348,6 @@ impl Task {
             continuation,
             yielder,
             clock,
-            causal_state,
             waiter: None,
             waker,
             woken: false,
@@ -385,7 +381,6 @@ impl Task {
         id: TaskId,
         name: Option<String>,
         clock: VectorClock,
-        causal_state: Option<CausalStateValue>,
         parent_span_id: Option<tracing::span::Id>,
         schedule_len: usize,
         tag: Option<Arc<dyn Tag>>,
@@ -398,7 +393,6 @@ impl Task {
             id,
             name,
             clock,
-            causal_state,
             parent_span_id,
             schedule_len,
             tag,
@@ -414,7 +408,6 @@ impl Task {
         id: TaskId,
         name: Option<String>,
         clock: VectorClock,
-        causal_state: Option<CausalStateValue>,
         parent_span_id: Option<tracing::span::Id>,
         schedule_len: usize,
         tag: Option<Arc<dyn Tag>>,
@@ -439,7 +432,6 @@ impl Task {
             id,
             name,
             clock,
-            causal_state,
             parent_span_id,
             schedule_len,
             tag,

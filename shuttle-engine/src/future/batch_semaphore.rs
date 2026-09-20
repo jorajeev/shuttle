@@ -1,4 +1,5 @@
 //! A counting semaphore supporting both async and sync operations.
+use crate::runtime::causality::ApplicationStateSnapshot;
 use crate::runtime::causality::CausalSnapshot;
 use crate::runtime::execution::ExecutionState;
 use crate::runtime::task::TaskId;
@@ -252,7 +253,7 @@ struct BatchSemaphoreState {
     waiters: VecDeque<Arc<Waiter>>,
     permits_available: PermitsAvailable,
     closed: bool,
-    close_snapshot: CausalSnapshot,
+    close_snapshot: ApplicationStateSnapshot,
 }
 
 impl BatchSemaphoreState {
@@ -411,7 +412,7 @@ impl BatchSemaphore {
             waiters: VecDeque::new(),
             permits_available: PermitsAvailable::new(num_permits),
             closed: false,
-            close_snapshot: CausalSnapshot::new(),
+            close_snapshot: ApplicationStateSnapshot::new(),
         });
         Self {
             state,
@@ -440,7 +441,7 @@ impl BatchSemaphore {
             waiters: VecDeque::new(),
             permits_available: PermitsAvailable::const_new(num_permits),
             closed: false,
-            close_snapshot: CausalSnapshot::new(),
+            close_snapshot: ApplicationStateSnapshot::new(),
         });
         Self {
             state,
@@ -471,21 +472,30 @@ impl BatchSemaphore {
 
     /// Closes the semaphore without invoking `thread::switch`
     pub fn close_no_scheduling_point(&self) {
-        let snapshot = current::causal::try_capture().unwrap_or_default();
-        self.close_with_snapshot_no_scheduling_point(&snapshot);
+        let snapshot = current::causal::try_capture_application_state();
+        self.close_inner(snapshot.as_ref());
     }
 
-    /// Closes the semaphore using a snapshot captured by the operation that
-    /// caused the closure.
+    /// Closes the semaphore using application state captured by the operation
+    /// that caused the closure.
     #[doc(hidden)]
-    pub fn close_with_snapshot_no_scheduling_point(&self, snapshot: &CausalSnapshot) {
+    pub fn close_with_application_state_no_scheduling_point(&self, snapshot: &ApplicationStateSnapshot) {
+        self.close_inner(Some(snapshot));
+    }
+
+    fn close_inner(&self, snapshot: Option<&ApplicationStateSnapshot>) {
         self.init_object_id();
         let mut state = self.state.borrow_mut();
         if state.closed {
+            if let Some(snapshot) = snapshot {
+                state.close_snapshot.update(snapshot);
+            }
             return;
         }
         crate::annotations::record_semaphore_closed(state.id.unwrap());
-        state.close_snapshot.update(snapshot);
+        if let Some(snapshot) = snapshot {
+            state.close_snapshot.update(snapshot);
+        }
         state.closed = true;
 
         // Wake up all the waiters.  Since we've marked the state as closed, they
@@ -519,16 +529,19 @@ impl BatchSemaphore {
         state.closed
     }
 
-    fn close_snapshot(&self) -> Option<CausalSnapshot> {
+    fn close_snapshot(&self) -> Option<ApplicationStateSnapshot> {
         let state = self.state.borrow();
         state.closed.then(|| state.close_snapshot.clone())
     }
 
-    /// Joins the snapshot associated with closing this semaphore.
+    /// Joins the application state associated with closing this semaphore.
     #[doc(hidden)]
-    pub fn join_close_causality(&self) {
+    pub fn join_close_application_state(&self) {
+        if !current::causal::enabled() {
+            return;
+        }
         if let Some(snapshot) = self.close_snapshot() {
-            current::causal::join(&snapshot);
+            current::causal::join_application_state(&snapshot);
         }
     }
 
@@ -543,18 +556,19 @@ impl BatchSemaphore {
         let mut state = self.state.borrow_mut();
         let id = state.id.unwrap();
         let res = state.acquire_permits(num_permits, self.fairness);
-        let dependency = match &res {
-            Err(TryAcquireError::Closed) => Some(state.close_snapshot.clone()),
-            Err(TryAcquireError::NoPermits) => {
-                // Conservatively, the requester causally depends on the last
-                // successful acquire.
-                Some(state.permits_available.last_acquire.clone())
-            }
-            Ok(()) => None,
-        };
+        // Preserve the existing vector-clock behavior: any failed acquire
+        // depends on the last successful acquire.
+        let dependency = res.as_ref().err().map(|_| state.permits_available.last_acquire.clone());
+        let close_snapshot = matches!(res, Err(TryAcquireError::Closed))
+            .then(current::causal::enabled)
+            .filter(|enabled| *enabled)
+            .map(|_| state.close_snapshot.clone());
         drop(state);
         if let Some(dependency) = dependency {
             current::causal::join(&dependency);
+        }
+        if let Some(close_snapshot) = close_snapshot {
+            current::causal::join_application_state(&close_snapshot);
         }
 
         // If we won the race for permits of an unfair semaphore, re-block
@@ -906,11 +920,11 @@ impl Future for Acquire<'_> {
             self.completed = true;
             trace!("Acquire::poll for {:?} with permits", self);
             Poll::Ready(Ok(()))
-        } else if let Some(close_snapshot) = self.semaphore.close_snapshot() {
+        } else if self.semaphore.is_closed() {
             assert!(!self.is_queued());
             self.completed = true;
             trace!("Acquire::poll for {:?} with closed", self);
-            current::causal::join(&close_snapshot);
+            self.semaphore.join_close_application_state();
             Poll::Ready(Err(AcquireError::closed()))
         } else {
             let is_queued = self.is_queued();

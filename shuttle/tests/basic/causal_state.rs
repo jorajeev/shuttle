@@ -164,6 +164,22 @@ fn custom_primitives_can_capture_and_join_causality() {
 }
 
 #[test]
+fn application_state_snapshots_do_not_change_vector_clocks() {
+    runner().run(|| {
+        set(2);
+        let before_capture = shuttle::current::clock();
+        let snapshot = shuttle::current::causal::capture_application_state();
+        assert_eq!(shuttle::current::clock(), before_capture);
+
+        set(4);
+        let before_join = shuttle::current::clock();
+        shuttle::current::causal::join_application_state(&snapshot);
+        assert_eq!(shuttle::current::clock(), before_join);
+        assert_eq!(bits(), 7);
+    });
+}
+
+#[test]
 fn causal_state_is_joined_by_async_join_handle() {
     runner().run(|| {
         future::block_on(async {
@@ -203,7 +219,9 @@ fn causal_state_is_joined_by_cancelled_async_join_handle() {
             }
 
             set(4);
+            let before_abort = shuttle::current::clock();
             child.abort();
+            assert_eq!(shuttle::current::clock(), before_abort);
             assert!(matches!(child.await, Err(future::JoinError::Cancelled)));
             assert_eq!(bits(), 7);
         });
@@ -387,10 +405,17 @@ fn causal_state_crosses_once_completion() {
 #[test]
 fn causal_state_crosses_implicit_scoped_thread_completion() {
     runner().run(|| {
+        let before_completion = Arc::new(std::sync::Mutex::new(None));
+        let before_completion_in_scope = Arc::clone(&before_completion);
         thread::scope(|scope| {
             scope.spawn(|| set(2));
+            *before_completion_in_scope.lock().unwrap() = Some(shuttle::current::clock());
         });
 
+        assert_eq!(
+            shuttle::current::clock(),
+            before_completion.lock().unwrap().clone().unwrap()
+        );
         assert_eq!(bits(), 3);
     });
 }
@@ -418,7 +443,9 @@ fn causal_state_crosses_channel_closure() {
         while !closed.load(std::sync::atomic::Ordering::SeqCst) {
             thread::yield_now();
         }
+        let before = shuttle::current::clock();
         assert!(tx.send(()).is_err());
+        assert_eq!(shuttle::current::clock(), before);
         assert_eq!(bits(), 3);
         child.join().unwrap();
     });
@@ -444,7 +471,9 @@ fn causal_state_crosses_channel_closure() {
         while !closed.load(std::sync::atomic::Ordering::SeqCst) {
             thread::yield_now();
         }
+        let before = shuttle::current::clock();
         assert!(rx.recv().is_err());
+        assert_eq!(shuttle::current::clock(), before);
         assert_eq!(bits(), 3);
         child.join().unwrap();
     });

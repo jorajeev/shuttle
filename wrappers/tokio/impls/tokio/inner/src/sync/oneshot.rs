@@ -1,7 +1,7 @@
 //! A one-shot channel for sending a single value between asynchronous tasks.
 
 use futures::channel::oneshot;
-use shuttle::current::causal::{self, Snapshot};
+use shuttle::current::causal::{self, ApplicationStateSnapshot};
 use shuttle::future;
 use std::future::Future;
 use std::pin::{pin, Pin};
@@ -11,22 +11,28 @@ use tracing::trace;
 
 #[derive(Debug)]
 struct Shared {
-    sender_closed: Mutex<Snapshot>,
-    receiver_closed: Mutex<Snapshot>,
+    sender_closed: Mutex<ApplicationStateSnapshot>,
+    receiver_closed: Mutex<ApplicationStateSnapshot>,
+}
+
+#[derive(Debug)]
+struct Message<T> {
+    value: T,
+    snapshot: ApplicationStateSnapshot,
 }
 
 /// Sends a value to the associated [`Receiver`].
 #[derive(Debug)]
 pub struct Sender<T> {
-    inner: Option<oneshot::Sender<(T, Snapshot)>>,
-    shared: Arc<Shared>,
+    inner: Option<oneshot::Sender<Message<T>>>,
+    shared: Option<Arc<Shared>>,
 }
 
 /// Receives a value from the associated [`Sender`].
 #[derive(Debug)]
 pub struct Receiver<T> {
-    inner: oneshot::Receiver<(T, Snapshot)>,
-    shared: Arc<Shared>,
+    inner: oneshot::Receiver<Message<T>>,
+    shared: Option<Arc<Shared>>,
     closed: bool,
 }
 
@@ -72,14 +78,16 @@ use self::error::{RecvError, TryRecvError};
 /// Creates a new one-shot channel for sending a single value.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let (tx, rx) = oneshot::channel();
-    let shared = Arc::new(Shared {
-        sender_closed: Mutex::new(Snapshot::new()),
-        receiver_closed: Mutex::new(Snapshot::new()),
+    let shared = causal::enabled().then(|| {
+        Arc::new(Shared {
+            sender_closed: Mutex::new(ApplicationStateSnapshot::new()),
+            receiver_closed: Mutex::new(ApplicationStateSnapshot::new()),
+        })
     });
     (
         Sender {
             inner: Some(tx),
-            shared: Arc::clone(&shared),
+            shared: shared.clone(),
         },
         Receiver {
             inner: rx,
@@ -94,22 +102,28 @@ impl<T> Sender<T> {
     pub fn send(self, value: T) -> Result<(), T> {
         trace!("sending message on oneshot {:p}", self.inner.as_ref().unwrap());
         shuttle::thread::yield_now();
-        let snapshot = causal::capture();
+        let snapshot = self
+            .shared
+            .as_ref()
+            .map(|_| causal::capture_application_state())
+            .unwrap_or_default();
         self.send_captured(value, snapshot)
     }
 
-    pub(crate) fn send_with_snapshot(self, value: T, snapshot: Snapshot) -> Result<(), T> {
+    pub(crate) fn send_with_application_state(self, value: T, snapshot: ApplicationStateSnapshot) -> Result<(), T> {
         shuttle::thread::yield_now();
         self.send_captured(value, snapshot)
     }
 
-    fn send_captured(mut self, value: T, snapshot: Snapshot) -> Result<(), T> {
+    fn send_captured(mut self, value: T, snapshot: ApplicationStateSnapshot) -> Result<(), T> {
         let sender = self.inner.take().unwrap();
-        match sender.send((value, snapshot)) {
+        match sender.send(Message { value, snapshot }) {
             Ok(()) => Ok(()),
-            Err((value, _)) => {
-                let closed = self.shared.receiver_closed.lock().unwrap().clone();
-                causal::join_without_increment(&closed);
+            Err(Message { value, .. }) => {
+                if let Some(shared) = &self.shared {
+                    let closed = shared.receiver_closed.lock().unwrap().clone();
+                    causal::join_application_state(&closed);
+                }
                 Err(value)
             }
         }
@@ -120,8 +134,10 @@ impl<T> Sender<T> {
         trace!("sender waiting for oneshot receiver closure {:p}", self);
         self.inner.as_mut().unwrap().cancellation().await;
         future::yield_now().await;
-        let closed = self.shared.receiver_closed.lock().unwrap().clone();
-        causal::join(&closed);
+        if let Some(shared) = &self.shared {
+            let closed = shared.receiver_closed.lock().unwrap().clone();
+            causal::join_application_state(&closed);
+        }
     }
 
     /// Returns `true` if the associated receiver has been dropped.
@@ -133,8 +149,10 @@ impl<T> Sender<T> {
     pub fn poll_closed(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         let result = self.inner.as_mut().unwrap().poll_canceled(cx);
         if result.is_ready() {
-            let closed = self.shared.receiver_closed.lock().unwrap().clone();
-            causal::join(&closed);
+            if let Some(shared) = &self.shared {
+                let closed = shared.receiver_closed.lock().unwrap().clone();
+                causal::join_application_state(&closed);
+            }
         }
         result
     }
@@ -142,9 +160,9 @@ impl<T> Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        if self.inner.is_some() {
-            if let Some(snapshot) = causal::try_capture() {
-                self.shared.sender_closed.lock().unwrap().update(&snapshot);
+        if let (Some(_), Some(shared)) = (&self.inner, &self.shared) {
+            if let Some(snapshot) = causal::try_capture_application_state() {
+                shared.sender_closed.lock().unwrap().update(&snapshot);
             }
         }
     }
@@ -157,8 +175,10 @@ impl<T> Receiver<T> {
             return;
         }
         shuttle::thread::yield_now();
-        let snapshot = causal::capture();
-        self.shared.receiver_closed.lock().unwrap().update(&snapshot);
+        if let Some(shared) = &self.shared {
+            let snapshot = causal::capture_application_state();
+            shared.receiver_closed.lock().unwrap().update(&snapshot);
+        }
         self.inner.close();
         self.closed = true;
     }
@@ -167,14 +187,18 @@ impl<T> Receiver<T> {
     pub fn try_recv(&mut self) -> Result<T, TryRecvError> {
         shuttle::thread::yield_now();
         match self.inner.try_recv() {
-            Ok(Some((value, snapshot))) => {
-                causal::join(&snapshot);
+            Ok(Some(Message { value, snapshot })) => {
+                if self.shared.is_some() {
+                    causal::join_application_state(&snapshot);
+                }
                 Ok(value)
             }
             Ok(None) => Err(TryRecvError::Empty),
             Err(_) => {
-                let closed = self.shared.sender_closed.lock().unwrap().clone();
-                causal::join(&closed);
+                if let Some(shared) = &self.shared {
+                    let closed = shared.sender_closed.lock().unwrap().clone();
+                    causal::join_application_state(&closed);
+                }
                 Err(TryRecvError::Closed)
             }
         }
@@ -189,8 +213,10 @@ impl<T> Receiver<T> {
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         if !self.closed {
-            if let Some(snapshot) = causal::try_capture() {
-                self.shared.receiver_closed.lock().unwrap().update(&snapshot);
+            if let Some(shared) = &self.shared {
+                if let Some(snapshot) = causal::try_capture_application_state() {
+                    shared.receiver_closed.lock().unwrap().update(&snapshot);
+                }
             }
         }
     }
@@ -202,20 +228,23 @@ impl<T> Future for Receiver<T> {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let receiver = pin!(&mut self.inner);
         trace!("polling oneshot receiver {:p}", receiver);
-        let result = match receiver.poll(cx) {
-            Poll::Ready(Ok((value, snapshot))) => {
+        match receiver.poll(cx) {
+            Poll::Ready(Ok(Message { value, snapshot })) => {
                 shuttle::thread::yield_now();
-                causal::join(&snapshot);
+                if self.shared.is_some() {
+                    causal::join_application_state(&snapshot);
+                }
                 Poll::Ready(Ok(value))
             }
             Poll::Ready(Err(_)) => {
                 shuttle::thread::yield_now();
-                let closed = self.shared.sender_closed.lock().unwrap().clone();
-                causal::join(&closed);
+                if let Some(shared) = &self.shared {
+                    let closed = shared.sender_closed.lock().unwrap().clone();
+                    causal::join_application_state(&closed);
+                }
                 Poll::Ready(Err(RecvError(())))
             }
             Poll::Pending => Poll::Pending,
-        };
-        result
+        }
     }
 }

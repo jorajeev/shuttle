@@ -26,7 +26,6 @@ This crate holds the machinery that executes and controls a Shuttle test:
 ## Features
 
 * `vector-clocks` — track causality between tasks. Required for the `current` clock APIs.
-* `causal-state` — propagate an application-defined joinable value along modeled happens-before edges.
 * `annotation` — emit annotated schedules for the
   [Shuttle Explorer](https://github.com/awslabs/shuttle/tree/main/shuttle-explorer) extension.
 

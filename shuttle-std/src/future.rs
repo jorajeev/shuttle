@@ -34,9 +34,9 @@ fn abort_task(task_id: TaskId, aborted: &AtomicBool) {
         }
 
         let current = state.current().id();
-        let snapshot = state.increment_causality();
         if current != task_id {
-            state.update_causality_for_task(task_id, &snapshot);
+            let snapshot = state.get_application_causality(current);
+            state.join_application_causality_for_task(task_id, &snapshot);
         }
         state.get_mut(task_id).abort();
     });

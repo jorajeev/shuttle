@@ -1,6 +1,6 @@
 # Unreleased
 
-* Add the optional `causal-state` feature for propagating one application-defined, joinable value through task creation and modeled synchronization edges. The current value is stored in task labels and can be read or updated through `shuttle::current`.
+* Add support for propagating one application-defined, joinable value through task creation and modeled synchronization edges. Shuttle stores the value as private execution state and applications can read or extend it through `shuttle::current::causal`.
 
 * Performance: `BatchSemaphore` no longer takes a `std::sync::Mutex` in a release-mode assertion on every `Acquire` poll, and allocates its `Waiter` only when an acquire actually blocks. Uncontended synchronization operations (`Mutex`, `RwLock`, `Semaphore`, channels) are 43-50% faster.
 

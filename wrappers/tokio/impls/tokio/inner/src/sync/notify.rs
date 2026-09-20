@@ -5,7 +5,7 @@
 /// another task to perform an operation.
 use crate::sync::oneshot;
 use pin_project::{pin_project, pinned_drop};
-use shuttle::current::causal::{self, Snapshot};
+use shuttle::current::causal::{self, ApplicationStateSnapshot};
 use shuttle::rand::{rngs::ThreadRng, thread_rng, Rng};
 use std::collections::VecDeque;
 use std::future::Future;
@@ -22,14 +22,21 @@ pub struct Notify {
 
 #[derive(Debug)]
 struct NotifyState {
+    // Cached because the global causal-state mode cannot change after runtime
+    // initialization.
+    causal_enabled: bool,
+
     // For assigning unique ids to waiters
     next_id: usize,
 
     // Seed for selecting waiters to notify at random
     rng: ThreadRng,
 
-    // Causality associated with a pending permit.
-    pending: Option<Snapshot>,
+    // Whether a notify is pending.
+    pending: bool,
+
+    // Application state associated with a pending permit.
+    pending_snapshot: ApplicationStateSnapshot,
 
     // List of waiters
     waiters: VecDeque<Waiter>,
@@ -38,9 +45,11 @@ struct NotifyState {
 impl NotifyState {
     fn new() -> Self {
         Self {
+            causal_enabled: causal::enabled(),
             next_id: 0,
             rng: thread_rng(),
-            pending: None,
+            pending: false,
+            pending_snapshot: ApplicationStateSnapshot::new(),
             waiters: VecDeque::new(),
         }
     }
@@ -63,7 +72,7 @@ const NOTIFIED: usize = 2; // notified
 #[derive(Debug)]
 struct Waiter {
     flag: Arc<AtomicUsize>,
-    snapshot: Arc<Mutex<Option<Snapshot>>>,
+    snapshot: Option<Arc<Mutex<Option<ApplicationStateSnapshot>>>>,
     id: usize,
     tx: oneshot::Sender<()>,
 }
@@ -77,7 +86,7 @@ struct Waiter {
 pub struct Notified<'a> {
     id: usize, // unique id for this waiter
     flag: Arc<AtomicUsize>,
-    snapshot: Arc<Mutex<Option<Snapshot>>>,
+    snapshot: Option<Arc<Mutex<Option<ApplicationStateSnapshot>>>>,
     /// The `Notify` being received on.
     notify: &'a Notify,
     // oneshot being awaited on
@@ -103,10 +112,10 @@ impl Notify {
         let id = state.next_id;
         state.next_id += 1;
         let flag = Arc::new(AtomicUsize::new(INIT));
-        let snapshot = Arc::new(Mutex::new(None));
+        let snapshot = state.causal_enabled.then(|| Arc::new(Mutex::new(None)));
         let waiter = Waiter {
             flag: flag.clone(),
-            snapshot: Arc::clone(&snapshot),
+            snapshot: snapshot.clone(),
             id,
             tx,
         };
@@ -146,27 +155,38 @@ impl Notify {
         }
         trace!("notify_one for {:p} notifying waiters {:?}", self, pending);
         if pending.is_empty() {
-            let snapshot = causal::capture();
-            match &mut state.pending {
-                Some(pending) => pending.update(&snapshot),
-                None => state.pending = Some(snapshot),
+            if state.causal_enabled {
+                let snapshot = causal::capture_application_state();
+                if state.pending {
+                    state.pending_snapshot.update(&snapshot);
+                } else {
+                    state.pending_snapshot = snapshot;
+                }
             }
+            state.pending = true;
         } else {
             // Choose a pending waiter at random
             let index = state.rng.gen_range(0..pending.len());
             let id = pending[index];
             // Remove waiter and mark it notified
             let waiter = state.remove_waiter(id);
-            state.pending = None;
+            state.pending = false;
+            state.pending_snapshot = ApplicationStateSnapshot::new();
             drop(state);
             trace!("notify_one for {:?} waking waiter {:?}", self, waiter.id);
-            *waiter.snapshot.lock().unwrap() = Some(causal::capture());
+            if let Some(snapshot) = &waiter.snapshot {
+                *snapshot.lock().unwrap() = Some(causal::capture_application_state());
+            }
             // Must set flag before notifying waiter.
             // The send may fail if the Notified future is dropped between the flag store
             // and the send (the flag is already NOTIFIED, so the future already completed).
             waiter.flag.store(NOTIFIED, Ordering::SeqCst);
-            let snapshot = waiter.snapshot.lock().unwrap().clone().unwrap();
-            let _ = waiter.tx.send_with_snapshot((), snapshot);
+            if let Some(snapshot) = &waiter.snapshot {
+                let snapshot = snapshot.lock().unwrap().clone().unwrap();
+                let _ = waiter.tx.send_with_application_state((), snapshot);
+            } else {
+                let _ = waiter.tx.send(());
+            }
         }
     }
 
@@ -181,24 +201,31 @@ impl Notify {
         let mut state = self.state.lock().unwrap();
         // Notify all waiters, including those not yet enabled
         let waiters = std::mem::take(&mut state.waiters);
+        let snapshot = state.causal_enabled.then(causal::capture_application_state);
         trace!("notify_waiters for {:p} notifying waiters {:?}", self, waiters);
-        state.pending = None;
+        state.pending = false;
+        state.pending_snapshot = ApplicationStateSnapshot::new();
         drop(state);
         // Since we have removed all the waiters, we need to clear all the
         // flags first, before waking any of them.  This is because sending
         // a oneshot to wake a waiter will admit context switches, and we
         // could invoke the drop handler for a waiter whose flag has not been
         // cleared.
-        let snapshot = causal::capture();
         for w in &waiters {
-            *w.snapshot.lock().unwrap() = Some(snapshot.clone());
+            if let (Some(slot), Some(snapshot)) = (&w.snapshot, &snapshot) {
+                *slot.lock().unwrap() = Some(snapshot.clone());
+            }
             // Must set flag before notifying waiter
             let flag = w.flag.swap(NOTIFIED, Ordering::SeqCst);
             assert!(flag == INIT || flag == ENABLED);
         }
         for w in waiters {
-            let snapshot = w.snapshot.lock().unwrap().clone().unwrap();
-            let _ = w.tx.send_with_snapshot((), snapshot); // Note this may fail if the waiter has dropped
+            if let Some(snapshot) = &w.snapshot {
+                let snapshot = snapshot.lock().unwrap().clone().unwrap();
+                let _ = w.tx.send_with_application_state((), snapshot);
+            } else {
+                let _ = w.tx.send(());
+            }
         }
     }
 }
@@ -244,8 +271,10 @@ impl Notified<'_> {
     fn poll_inner(&self) -> bool {
         let flag = self.flag.load(Ordering::SeqCst);
         if flag == NOTIFIED {
-            if let Some(snapshot) = self.snapshot.lock().unwrap().take() {
-                causal::join(&snapshot);
+            if let Some(slot) = &self.snapshot {
+                if let Some(snapshot) = slot.lock().unwrap().take() {
+                    causal::join_application_state(&snapshot);
+                }
             }
             return true;
         }
@@ -254,14 +283,15 @@ impl Notified<'_> {
             self.flag.store(ENABLED, Ordering::SeqCst);
         }
         let mut state = self.notify.state.lock().unwrap();
-        if let Some(snapshot) = state.pending.take() {
+        if std::mem::replace(&mut state.pending, false) {
+            let snapshot = std::mem::take(&mut state.pending_snapshot);
             trace!("waiter {} in state {:?} consuming permit", self.id, flag);
             // We just consumed a permit, so mark this future ready and remove
             // the waiter
             let waiter = state.remove_waiter(self.id);
             drop(state);
             waiter.flag.store(NOTIFIED, Ordering::SeqCst);
-            causal::join(&snapshot);
+            causal::join_application_state(&snapshot);
             drop(waiter.tx);
             true
         } else {

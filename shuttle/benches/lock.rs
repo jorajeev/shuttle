@@ -1,7 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use shuttle::scheduler::{PctScheduler, RandomScheduler, Scheduler};
 use shuttle::sync::Mutex;
-#[cfg(feature = "causal-state")]
 use shuttle::Config;
 use shuttle::{thread, Runner};
 use std::sync::Arc;
@@ -38,7 +37,6 @@ fn lock_benchmark(scheduler: impl Scheduler + 'static, num_tasks: u32, num_event
     });
 }
 
-#[cfg(feature = "causal-state")]
 fn lock_benchmark_with_causal_state(scheduler: impl Scheduler + 'static, num_tasks: u32, num_events_per_task: u32) {
     #[derive(Clone)]
     struct Frontier(u64);
@@ -89,7 +87,6 @@ pub fn lock_sync_benchmark(c: &mut Criterion) {
         });
     });
 
-    #[cfg(feature = "causal-state")]
     g.bench_function("random-narrow-causal-state", |b| {
         b.iter(|| {
             let scheduler = RandomScheduler::new_from_seed(0x12345678, ITERATIONS);
