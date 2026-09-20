@@ -250,18 +250,18 @@ impl Condvar {
         trace!(waiters=?state.waiters, next_epoch=state.next_epoch, "notifying one on condvar {:p}", self);
 
         let epoch = state.next_epoch;
+        let clock = current::causal::capture();
         for (tid, status) in state.waiters.iter_mut() {
             assert_ne!(*tid, me);
 
-            let clock = current::causal_snapshot();
             match status {
                 CondvarWaitStatus::Waiting => {
                     let mut epochs = VecDeque::new();
-                    epochs.push_back((epoch, clock));
+                    epochs.push_back((epoch, clock.clone()));
                     *status = CondvarWaitStatus::Signal(epochs);
                 }
                 CondvarWaitStatus::Signal(epochs) => {
-                    epochs.push_back((epoch, clock));
+                    epochs.push_back((epoch, clock.clone()));
                 }
                 CondvarWaitStatus::Broadcast(_) => {
                     // no-op, broadcast will already unblock this task
@@ -286,9 +286,10 @@ impl Condvar {
 
         trace!(waiters=?state.waiters, next_epoch=state.next_epoch, "notifying all on condvar {:p}", self);
 
+        let clock = current::causal::capture();
         for (tid, status) in state.waiters.iter_mut() {
             assert_ne!(*tid, me);
-            *status = CondvarWaitStatus::Broadcast(current::causal_snapshot());
+            *status = CondvarWaitStatus::Broadcast(clock.clone());
             // Note: the task might have been unblocked by a previous signal
             ExecutionState::with(|s| s.get_mut(*tid).unblock());
         }

@@ -1,4 +1,4 @@
-use crate::runtime::causality::CausalSnapshot;
+use crate::runtime::causality::{CausalSnapshot, CausalStateValue, ExecutionId};
 use crate::runtime::failure::{init_panic_hook, persist_failure};
 use crate::runtime::storage::{StorageKey, StorageMap};
 use crate::runtime::task::clock::VectorClock;
@@ -318,6 +318,7 @@ impl Execution {
 /// tasks are pending spawn.
 pub struct ExecutionState {
     pub config: Config,
+    execution_id: ExecutionId,
     // invariant: tasks are never removed from this list
     tasks: SmallVec<[Task; DEFAULT_INLINE_TASKS]>,
     // invariant: if this transitions to Stopped or Finished, it can never change again
@@ -402,6 +403,7 @@ impl ExecutionState {
     fn new(config: Config, scheduler: Rc<RefCell<dyn Scheduler>>) -> Self {
         Self {
             config,
+            execution_id: ExecutionId::fresh(),
             tasks: SmallVec::new(),
             current_task: ScheduledTask::None,
             next_task: ScheduledTask::None,
@@ -520,8 +522,6 @@ impl ExecutionState {
 
                     map.insert(task_id, child_map);
                 }
-            } else {
-                state.config.causal_state.initialize(map.entry(task_id).or_default());
             }
 
             // Add any name assigned to the task to its set of Labels
@@ -530,6 +530,12 @@ impl ExecutionState {
                 m.insert(TaskName::from(name));
             }
         });
+    }
+
+    fn causal_state_for_new_task(&self) -> Option<CausalStateValue> {
+        self.try_current()
+            .and_then(|parent| parent.causal_state.clone())
+            .or_else(|| self.config.causal_state.initialize())
     }
 
     // Note: `spawn_thread`, `spawn_main_thread`, and `spawn_future` share some similar logic.
@@ -548,6 +554,7 @@ impl ExecutionState {
             let tag = state.get_tag_or_default_for_current_task();
 
             Self::set_labels_for_new_task(state, task_id, Some(name.clone()));
+            let causal_state = state.causal_state_for_new_task();
 
             clock.extend(task_id); // and extend it with an entry for the new thread
 
@@ -559,6 +566,7 @@ impl ExecutionState {
                 task_id,
                 Some(name),
                 clock,
+                causal_state,
                 parent_span_id,
                 schedule_len,
                 tag,
@@ -595,6 +603,7 @@ impl ExecutionState {
             let tag = state.get_tag_or_default_for_current_task();
 
             Self::set_labels_for_new_task(state, task_id, name.clone());
+            let causal_state = state.causal_state_for_new_task();
 
             let clock = state.increment_clock_mut(); // Increment the parent's clock
             clock.extend(task_id); // and extend it with an entry for the new task
@@ -605,6 +614,7 @@ impl ExecutionState {
                 task_id,
                 name,
                 clock.clone(),
+                causal_state,
                 parent_span_id,
                 schedule_len,
                 tag,
@@ -636,6 +646,7 @@ impl ExecutionState {
             let tag = state.get_tag_or_default_for_current_task();
 
             Self::set_labels_for_new_task(state, task_id, name.clone());
+            let causal_state = state.causal_state_for_new_task();
 
             let clock = if let Some(ref mut clock) = initial_clock {
                 clock
@@ -652,6 +663,7 @@ impl ExecutionState {
                 task_id,
                 name,
                 clock,
+                causal_state,
                 parent_span_id,
                 CurrentSchedule::len(),
                 tag,
@@ -865,63 +877,90 @@ impl ExecutionState {
 
     /// Get a snapshot of a task's vector clock and application-defined causal state.
     pub fn get_causality(&self, id: TaskId) -> CausalSnapshot {
-        let clock = self.get_clock(id).clone();
+        let task = self.get(id);
+        let clock = task.clock.clone();
         if !self.config.causal_state.is_enabled() {
-            return CausalSnapshot::from_clock(clock);
+            return CausalSnapshot::from_clock(self.execution_id, clock);
         }
-        LABELS.with(|cell| {
-            let map = cell.borrow();
-            self.config.causal_state.capture(clock, map.get(&id))
-        })
+        self.config
+            .causal_state
+            .capture(self.execution_id, clock, task.causal_state.as_ref())
     }
 
     /// Increment the current task's vector clock and snapshot its causal state.
     pub fn increment_causality(&mut self) -> CausalSnapshot {
         let clock = self.increment_clock().clone();
         if !self.config.causal_state.is_enabled() {
-            return CausalSnapshot::from_clock(clock);
+            return CausalSnapshot::from_clock(self.execution_id, clock);
         }
         let task_id = self.current().id();
-        LABELS.with(|cell| {
-            let map = cell.borrow();
-            self.config.causal_state.capture(clock, map.get(&task_id))
-        })
+        self.config
+            .causal_state
+            .capture(self.execution_id, clock, self.get(task_id).causal_state.as_ref())
     }
 
     /// Increment the current task and join a causal snapshot into it.
     pub fn update_causality(&mut self, snapshot: &CausalSnapshot) {
-        self.update_clock(snapshot.clock());
-        if self.config.causal_state.is_enabled() {
-            let task_id = self.current().id();
+        let task_id = self.current().id();
+        let belongs_to_execution = snapshot.belongs_to(self.execution_id);
+        {
+            let task = self.get_mut(task_id);
+            task.clock.increment(task_id);
+            if belongs_to_execution {
+                task.clock.update(snapshot.clock());
+            }
+        }
+        if belongs_to_execution {
             self.merge_causal_state(task_id, snapshot);
         }
     }
 
     /// Join a causal snapshot into a task without incrementing its vector clock.
     pub fn join_causality_for_task(&mut self, task_id: TaskId, snapshot: &CausalSnapshot) {
-        self.get_clock_mut(task_id).update(snapshot.clock());
-        self.merge_causal_state(task_id, snapshot);
+        if snapshot.belongs_to(self.execution_id) {
+            self.get_clock_mut(task_id).update(snapshot.clock());
+            self.merge_causal_state(task_id, snapshot);
+        }
     }
 
     /// Increment a task and join a causal snapshot into it.
     pub fn update_causality_for_task(&mut self, task_id: TaskId, snapshot: &CausalSnapshot) {
+        let belongs_to_execution = snapshot.belongs_to(self.execution_id);
         {
             let task = self.get_mut(task_id);
             task.clock.increment(task_id);
-            task.clock.update(snapshot.clock());
+            if belongs_to_execution {
+                task.clock.update(snapshot.clock());
+            }
         }
-        self.merge_causal_state(task_id, snapshot);
+        if belongs_to_execution {
+            self.merge_causal_state(task_id, snapshot);
+        }
     }
 
-    fn merge_causal_state(&self, task_id: TaskId, snapshot: &CausalSnapshot) {
+    fn merge_causal_state(&mut self, task_id: TaskId, snapshot: &CausalSnapshot) {
         if !self.config.causal_state.is_enabled() {
             return;
         }
-        LABELS.with(|cell| {
-            let mut map = cell.borrow_mut();
-            let labels = map.entry(task_id).or_default();
-            self.config.causal_state.merge_into_labels(labels, snapshot);
-        });
+        let causal_state = self.config.causal_state.clone();
+        causal_state.merge_into(&mut self.get_mut(task_id).causal_state, snapshot);
+    }
+
+    #[cfg(feature = "causal-state")]
+    pub fn causal_state<T>(&self, task_id: TaskId) -> T
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        self.config.causal_state.state(self.get(task_id).causal_state.as_ref())
+    }
+
+    #[cfg(feature = "causal-state")]
+    pub fn join_causal_state<T>(&mut self, task_id: TaskId, incoming: T)
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        let causal_state = self.config.causal_state.clone();
+        causal_state.join_state(&mut self.get_mut(task_id).causal_state, incoming);
     }
 
     /// Increment the current thread's clock entry and update its clock with the one provided.

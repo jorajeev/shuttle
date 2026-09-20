@@ -122,7 +122,7 @@ impl PermitsAvailable {
     fn new(num_permits: usize) -> Self {
         let mut permit_clocks = VecDeque::new();
         if num_permits > 0 {
-            permit_clocks.push_back((num_permits, current::causal_snapshot()));
+            permit_clocks.push_back((num_permits, current::causal::snapshot()));
         }
         Self {
             num_available: num_permits,
@@ -251,8 +251,8 @@ struct BatchSemaphoreState {
     // (4) closed ==> waiters.is_empty()
     waiters: VecDeque<Arc<Waiter>>,
     permits_available: PermitsAvailable,
-    // TODO: should there be a clock for the close event?
     closed: bool,
+    close_snapshot: CausalSnapshot,
 }
 
 impl BatchSemaphoreState {
@@ -271,7 +271,7 @@ impl BatchSemaphoreState {
 
             let clock = self
                 .permits_available
-                .acquire(num_permits, current::causal_snapshot())?;
+                .acquire(num_permits, current::causal::snapshot())?;
 
             // If successful, the acquiry is causally dependent on the event
             // which released the acquired permits.
@@ -411,6 +411,7 @@ impl BatchSemaphore {
             waiters: VecDeque::new(),
             permits_available: PermitsAvailable::new(num_permits),
             closed: false,
+            close_snapshot: CausalSnapshot::new(),
         });
         Self {
             state,
@@ -439,6 +440,7 @@ impl BatchSemaphore {
             waiters: VecDeque::new(),
             permits_available: PermitsAvailable::const_new(num_permits),
             closed: false,
+            close_snapshot: CausalSnapshot::new(),
         });
         Self {
             state,
@@ -469,12 +471,21 @@ impl BatchSemaphore {
 
     /// Closes the semaphore without invoking `thread::switch`
     pub fn close_no_scheduling_point(&self) {
+        let snapshot = current::causal::try_capture().unwrap_or_default();
+        self.close_with_snapshot_no_scheduling_point(&snapshot);
+    }
+
+    /// Closes the semaphore using a snapshot captured by the operation that
+    /// caused the closure.
+    #[doc(hidden)]
+    pub fn close_with_snapshot_no_scheduling_point(&self, snapshot: &CausalSnapshot) {
         self.init_object_id();
         let mut state = self.state.borrow_mut();
         if state.closed {
             return;
         }
         crate::annotations::record_semaphore_closed(state.id.unwrap());
+        state.close_snapshot.update(snapshot);
         state.closed = true;
 
         // Wake up all the waiters.  Since we've marked the state as closed, they
@@ -508,6 +519,19 @@ impl BatchSemaphore {
         state.closed
     }
 
+    fn close_snapshot(&self) -> Option<CausalSnapshot> {
+        let state = self.state.borrow();
+        state.closed.then(|| state.close_snapshot.clone())
+    }
+
+    /// Joins the snapshot associated with closing this semaphore.
+    #[doc(hidden)]
+    pub fn join_close_causality(&self) {
+        if let Some(snapshot) = self.close_snapshot() {
+            current::causal::join(&snapshot);
+        }
+    }
+
     /// Try to acquire the specified number of permits from the Semaphore.
     /// If the permits are available, returns Ok(())
     /// If the semaphore is closed, returns `Err(TryAcquireError::Closed)`
@@ -518,25 +542,20 @@ impl BatchSemaphore {
         self.init_object_id();
         let mut state = self.state.borrow_mut();
         let id = state.id.unwrap();
-        let res = state.acquire_permits(num_permits, self.fairness).inspect_err(|_err| {
-            // Conservatively, the requester causally depends on the
-            // last successful acquire.
-            // TODO: This is not precise, but `try_acquire` causal dependency
-            // TODO: is both hard to define, and is most likely not worth the
-            // TODO: effort. The cases where causality would be tracked
-            // TODO: "imprecisely" do not correspond to commonly used sync.
-            // TODO: primitives, such as mutexes, mutexes, or condvars.
-            // TODO: An example would be a counting semaphore used to guard
-            // TODO: access to N homogenous resources (as opposed to FIFO,
-            // TODO: heterogenous resources).
-            // TODO: More precision could be gained by tracking clocks for all
-            // TODO: current permit holders, with a data structure similar to
-            // TODO: `permits_available`.
-            ExecutionState::with(|s| {
-                s.update_causality(&state.permits_available.last_acquire);
-            });
-        });
+        let res = state.acquire_permits(num_permits, self.fairness);
+        let dependency = match &res {
+            Err(TryAcquireError::Closed) => Some(state.close_snapshot.clone()),
+            Err(TryAcquireError::NoPermits) => {
+                // Conservatively, the requester causally depends on the last
+                // successful acquire.
+                Some(state.permits_available.last_acquire.clone())
+            }
+            Ok(()) => None,
+        };
         drop(state);
+        if let Some(dependency) = dependency {
+            current::causal::join(&dependency);
+        }
 
         // If we won the race for permits of an unfair semaphore, re-block
         // other waiting threads that can no longer succeed.
@@ -793,7 +812,7 @@ impl<'a> Acquire<'a> {
         Self {
             semaphore,
             num_permits,
-            clock: current::causal_snapshot(),
+            clock: current::causal::snapshot(),
             waiter: None,
             has_permits: false,
             completed: false,
@@ -887,10 +906,11 @@ impl Future for Acquire<'_> {
             self.completed = true;
             trace!("Acquire::poll for {:?} with permits", self);
             Poll::Ready(Ok(()))
-        } else if self.semaphore.is_closed() {
+        } else if let Some(close_snapshot) = self.semaphore.close_snapshot() {
             assert!(!self.is_queued());
             self.completed = true;
             trace!("Acquire::poll for {:?} with closed", self);
+            current::causal::join(&close_snapshot);
             Poll::Ready(Err(AcquireError::closed()))
         } else {
             let is_queued = self.is_queued();

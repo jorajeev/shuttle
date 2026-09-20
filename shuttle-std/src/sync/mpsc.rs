@@ -85,6 +85,8 @@ struct ChannelState<T> {
     receiver_clock: Option<SmallVec<[CausalSnapshot; MAX_INLINE_MESSAGES]>>, // receiver causal snapshots for bounded case
     known_senders: usize,   // number of senders referencing this channel
     known_receivers: usize, // number or receivers referencing this channel
+    sender_closed: CausalSnapshot,
+    receiver_closed: CausalSnapshot,
     waiting_senders: SmallVec<[TaskId; DEFAULT_INLINE_TASKS]>, // list of currently blocked senders
     waiting_receivers: SmallVec<[TaskId; DEFAULT_INLINE_TASKS]>, // list of currently blocked receivers
 }
@@ -123,6 +125,8 @@ impl<T> Channel<T> {
                 receiver_clock,
                 known_senders: 1,
                 known_receivers: 1,
+                sender_closed: CausalSnapshot::new(),
+                receiver_closed: CausalSnapshot::new(),
                 waiting_senders: SmallVec::new(),
                 waiting_receivers: SmallVec::new(),
             })),
@@ -179,6 +183,9 @@ impl<T> Channel<T> {
         );
         if state.known_receivers == 0 {
             // No receivers are left, so the channel is disconnected.  Stop and return failure.
+            let closed = state.receiver_closed.clone();
+            drop(state);
+            shuttle_engine::current::causal::join(&closed);
             return Err(TrySendError::Disconnected(message));
         }
 
@@ -212,6 +219,9 @@ impl<T> Channel<T> {
             if state.known_receivers == 0 {
                 state.waiting_senders.retain(|t| *t != me);
                 // No receivers are left, so the channel is disconnected.  Stop and return failure.
+                let closed = state.receiver_closed.clone();
+                drop(state);
+                shuttle_engine::current::causal::join(&closed);
                 return Err(TrySendError::Disconnected(message));
             }
 
@@ -290,6 +300,9 @@ impl<T> Channel<T> {
         // Check if there are any senders left; if not, and the channel is empty, fail with error
         // (If there are no senders, but the channel is nonempty, the receiver can successfully consume that message.)
         if state.messages.is_empty() && state.known_senders == 0 {
+            let closed = state.sender_closed.clone();
+            drop(state);
+            shuttle_engine::current::causal::join(&closed);
             return Err(TryRecvError::Disconnected);
         }
 
@@ -350,6 +363,9 @@ impl<T> Channel<T> {
             // We repeat this check because the senders may have disconnected while the receiver was blocked.
             if state.messages.is_empty() && state.known_senders == 0 {
                 state.waiting_receivers.retain(|t| *t != me);
+                let closed = state.sender_closed.clone();
+                drop(state);
+                shuttle_engine::current::causal::join(&closed);
                 return Err(TryRecvError::Disconnected);
             }
 
@@ -454,6 +470,9 @@ impl<T> Drop for Receiver<T> {
         assert!(state.known_receivers > 0);
         state.known_receivers -= 1;
         if state.known_receivers == 0 {
+            state
+                .receiver_closed
+                .update(&shuttle_engine::current::causal::capture());
             // Last receiver was dropped; wake up all senders
             for &tid in state.waiting_senders.iter() {
                 ExecutionState::with(|s| s.get_mut(tid).unblock());
@@ -580,6 +599,7 @@ impl<T> Drop for Sender<T> {
         assert!(state.known_senders > 0);
         state.known_senders -= 1;
         if state.known_senders == 0 {
+            state.sender_closed.update(&shuttle_engine::current::causal::capture());
             // Last sender was dropped; wake up all receivers
             for &tid in state.waiting_receivers.iter() {
                 ExecutionState::with(|s| s.get_mut(tid).unblock());
@@ -640,6 +660,7 @@ impl<T> Drop for SyncSender<T> {
         assert!(state.known_senders > 0);
         state.known_senders -= 1;
         if state.known_senders == 0 {
+            state.sender_closed.update(&shuttle_engine::current::causal::capture());
             // Last sender was dropped; wake up any receivers
             for &tid in state.waiting_receivers.iter() {
                 ExecutionState::with(|s| s.get_mut(tid).unblock());
@@ -673,19 +694,22 @@ mod tests {
         #[derive(Clone, Copy)]
         struct Bits(u8);
 
-        let config = Config::default().with_causal_state(Bits(1), |current, incoming| {
-            current.0 |= incoming.0;
-        });
+        let config = Config::default().with_causal_state(
+            || Bits(1),
+            |current, incoming| {
+                current.0 |= incoming.0;
+            },
+        );
 
         Runner::new(RoundRobinScheduler::new(1), config).run(|| {
             let (tx, rx) = channel();
             let child = crate::thread::spawn(move || {
-                shuttle_engine::current::set_causal_state(Bits(2));
+                shuttle_engine::current::causal::join_state(Bits(2));
                 tx.send(()).unwrap();
             });
 
             rx.recv().unwrap();
-            assert_eq!(shuttle_engine::current::causal_state::<Bits>().0, 3);
+            assert_eq!(shuttle_engine::current::causal::state::<Bits>().0, 3);
             child.join().unwrap();
         });
     }

@@ -57,11 +57,12 @@
 
 use crate::sync::notify::Notify;
 use crate::sync::{RwLock, RwLockReadGuard};
+use shuttle::current::causal::{self, Snapshot};
 use std::mem;
 use std::ops;
 use std::panic;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Receives values from the associated [`Sender`](struct@Sender).
 ///
@@ -138,6 +139,15 @@ struct Shared<T> {
 
     /// Notifies any task listening for `Receiver` dropped events.
     notify_tx: Notify,
+
+    /// Causality associated with the most recent value change.
+    change_snapshot: Mutex<Snapshot>,
+
+    /// Causality associated with closing the send side.
+    sender_closed: Mutex<Snapshot>,
+
+    /// Causality associated with closing the receive side.
+    receiver_closed: Mutex<Snapshot>,
 }
 
 pub mod error {
@@ -275,6 +285,9 @@ pub fn channel<T>(init: T) -> (Sender<T>, Receiver<T>) {
         ref_count_tx: AtomicUsize::new(1),
         notify_rx: Notify::new(),
         notify_tx: Notify::new(),
+        change_snapshot: Mutex::new(Snapshot::new()),
+        sender_closed: Mutex::new(Snapshot::new()),
+        receiver_closed: Mutex::new(Snapshot::new()),
     });
 
     let tx = Sender { shared: shared.clone() };
@@ -584,11 +597,14 @@ fn maybe_changed<T>(shared: &Shared<T>, version: &mut Version) -> Option<Result<
     if *version != new_version {
         // Observe the new version and return
         *version = new_version;
+        let snapshot = shared.change_snapshot.lock().unwrap().clone();
+        causal::join(&snapshot);
         return Some(Ok(()));
     }
 
     if state.is_closed() {
-        // All receivers have dropped.
+        let snapshot = shared.sender_closed.lock().unwrap().clone();
+        causal::join(&snapshot);
         return Some(Err(error::RecvError(())));
     }
 
@@ -631,6 +647,9 @@ impl<T> Drop for Receiver<T> {
         );
         if 1 == self.shared.ref_count_rx.fetch_sub(1, Ordering::SeqCst) {
             // This is the last `Receiver` handle, tasks waiting on `Sender::closed()`
+            if let Some(snapshot) = causal::try_capture() {
+                self.shared.receiver_closed.lock().unwrap().update(&snapshot);
+            }
             self.shared.notify_tx.notify_waiters();
         }
     }
@@ -649,6 +668,8 @@ impl<T> Sender<T> {
         );
         // This is pretty much only useful as a hint anyway, so synchronization isn't critical.
         if 0 == self.receiver_count() {
+            let snapshot = self.shared.receiver_closed.lock().unwrap().clone();
+            causal::join(&snapshot);
             return Err(error::SendError(value));
         }
 
@@ -789,6 +810,8 @@ impl<T> Sender<T> {
             // value they are currently looking at.
             drop(lock);
         }
+        let snapshot = causal::capture();
+        self.shared.change_snapshot.lock().unwrap().update(&snapshot);
         self.shared.notify_rx.notify_waiters();
         true
     }
@@ -881,16 +904,26 @@ impl<T> Sender<T> {
     /// }
     /// ```
     pub async fn closed(&self) {
-        while self.receiver_count() > 0 {
+        loop {
+            if self.receiver_count() == 0 {
+                let snapshot = self.shared.receiver_closed.lock().unwrap().clone();
+                causal::join(&snapshot);
+                return;
+            }
+
             let notified = self.shared.notify_tx.notified();
 
             if self.receiver_count() == 0 {
+                let snapshot = self.shared.receiver_closed.lock().unwrap().clone();
+                causal::join(&snapshot);
                 return;
             }
 
             notified.await;
-            // The channel could have been reopened in the meantime by calling
-            // `subscribe`, so we loop again.
+
+            if self.receiver_count() == 0 {
+                return;
+            }
         }
     }
 
@@ -995,6 +1028,9 @@ impl<T> Clone for Sender<T> {
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         if 1 == self.shared.ref_count_tx.fetch_sub(1, Ordering::SeqCst) {
+            if let Some(snapshot) = causal::try_capture() {
+                self.shared.sender_closed.lock().unwrap().update(&snapshot);
+            }
             self.shared.state.set_closed();
             self.shared.notify_rx.notify_waiters();
         }

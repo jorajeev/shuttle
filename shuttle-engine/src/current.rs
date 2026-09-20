@@ -11,7 +11,6 @@
 //! Labels can also be used to build customized schedulers: for instance, they can be used to assign
 //! numeric weights to tasks, which can be used to implement a priority-preemptive scheduler.
 
-use crate::runtime::causality::CausalSnapshot;
 #[allow(deprecated)]
 use crate::runtime::execution::TASK_ID_TO_TAGS;
 use crate::runtime::execution::{CurrentSchedule, ExecutionState, LABELS};
@@ -47,78 +46,98 @@ pub fn clock_for(task_id: TaskId) -> VectorClock {
     ExecutionState::with(|state| state.get_clock(task_id).clone())
 }
 
-/// Get a snapshot of the current task's causal information.
+/// Causal state associated with the current task.
 ///
-/// This is an internal API used by Shuttle synchronization primitives.
-#[doc(hidden)]
-pub fn causal_snapshot() -> CausalSnapshot {
-    ExecutionState::with(|state| {
-        let task_id = state.current().id();
-        state.get_causality(task_id)
-    })
-}
+/// Applications normally use [`state`] and [`join_state`]. The opaque
+/// [`Snapshot`] API is intended for synchronization-library implementations.
+pub mod causal {
+    use crate::runtime::execution::ExecutionState;
 
-/// Get a clone of the application-defined causal state for the current task.
-#[cfg(feature = "causal-state")]
-pub fn causal_state<T>() -> T
-where
-    T: Clone + Send + Sync + 'static,
-{
-    let task_id = me();
-    ExecutionState::with(|state| {
-        assert!(
-            state.config.causal_state.is_type::<T>(),
-            "requested type is not the configured causal state"
-        );
-    });
-    with_labels_for_task(task_id, |labels| {
-        labels
-            .get::<T>()
-            .cloned()
-            .expect("current task has no configured causal state")
-    })
-}
+    /// An opaque snapshot containing vector-clock and application-defined
+    /// causal state.
+    pub use crate::runtime::causality::CausalSnapshot as Snapshot;
 
-/// Mutate the application-defined causal state for the current task.
-#[cfg(feature = "causal-state")]
-pub fn with_causal_state<T, F, R>(f: F) -> R
-where
-    T: Clone + Send + Sync + 'static,
-    F: FnOnce(&mut T) -> R,
-{
-    let task_id = me();
-    ExecutionState::with(|state| {
-        assert!(
-            state.config.causal_state.is_type::<T>(),
-            "requested type is not the configured causal state"
-        );
-    });
-    with_labels_for_task(task_id, |labels| {
-        let state = labels
-            .get_mut::<T>()
-            .expect("current task has no configured causal state");
-        f(state)
-    })
-}
+    /// Capture the current task's causal state.
+    ///
+    /// This advances the current task's vector clock but does not yield to the
+    /// scheduler.
+    pub fn capture() -> Snapshot {
+        ExecutionState::with(|state| state.increment_causality())
+    }
 
-/// Replace the application-defined causal state for the current task.
-#[cfg(feature = "causal-state")]
-pub fn set_causal_state<T>(value: T) -> T
-where
-    T: Clone + Send + Sync + 'static,
-{
-    let task_id = me();
-    ExecutionState::with(|state| {
-        assert!(
-            state.config.causal_state.is_type::<T>(),
-            "requested type is not the configured causal state"
-        );
-    });
-    with_labels_for_task(task_id, |labels| {
-        labels
-            .insert(value)
-            .expect("current task has no configured causal state")
-    })
+    /// Join a snapshot into the current task's causal state.
+    ///
+    /// This advances the current task's vector clock but does not yield to the
+    /// scheduler. Snapshots from older executions are ignored.
+    pub fn join(snapshot: &Snapshot) {
+        ExecutionState::with(|state| state.update_causality(snapshot));
+    }
+
+    /// Join a snapshot without advancing the current task's vector clock.
+    #[doc(hidden)]
+    pub fn join_without_increment(snapshot: &Snapshot) {
+        ExecutionState::with(|state| {
+            let task_id = state.current().id();
+            state.join_causality_for_task(task_id, snapshot);
+        });
+    }
+
+    /// Get a clone of the application-defined causal state for the current task.
+    #[cfg(feature = "causal-state")]
+    pub fn state<T>() -> T
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        ExecutionState::with(|execution| {
+            let task_id = execution.current().id();
+            execution.causal_state(task_id)
+        })
+    }
+
+    /// Join a value into the current task's application-defined causal state.
+    ///
+    /// The configured join operation must only add information.
+    #[cfg(feature = "causal-state")]
+    pub fn join_state<T>(incoming: T)
+    where
+        T: Clone + Send + Sync + 'static,
+    {
+        ExecutionState::with(|execution| {
+            let task_id = execution.current().id();
+            execution.join_causal_state(task_id, incoming);
+        });
+    }
+
+    /// Snapshot the current task without advancing its vector clock.
+    #[doc(hidden)]
+    pub fn snapshot() -> Snapshot {
+        ExecutionState::with(|state| {
+            let task_id = state.current().id();
+            state.get_causality(task_id)
+        })
+    }
+
+    /// Try to capture a snapshot without advancing the vector clock.
+    #[doc(hidden)]
+    pub fn try_snapshot() -> Option<Snapshot> {
+        ExecutionState::try_with(|state| {
+            let task_id = state.try_current()?.id();
+            Some(state.get_causality(task_id))
+        })
+        .ok()
+        .flatten()
+    }
+
+    /// Try to capture the current task and advance its vector clock.
+    #[doc(hidden)]
+    pub fn try_capture() -> Option<Snapshot> {
+        ExecutionState::try_with(|state| {
+            state.try_current()?;
+            Some(state.increment_causality())
+        })
+        .ok()
+        .flatten()
+    }
 }
 
 /// Apply the given function to the Labels for the specified task

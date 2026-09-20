@@ -1,6 +1,8 @@
 //! A multi-producer, single-consumer queue for sending values between
 //! asynchronous tasks.
 
+use crate::sync::Notify;
+use shuttle::current::causal::{self, Snapshot};
 use shuttle::future::{
     self,
     batch_semaphore::{Acquire, BatchSemaphore, Fairness, TryAcquireError},
@@ -30,6 +32,7 @@ struct Channel<T> {
     bound: Option<usize>, // None for an unbounded channel, Some(k) for bounded channel of size k
     recv_semaphore: Arc<BatchSemaphore>, // semaphore used to signal receivers
     send_semaphore: Arc<BatchSemaphore>, // semaphore used to block senders. Also tracks whether the channel is closed for sending messages.
+    receiver_closed: Notify,
     state: Arc<Mutex<ChannelState<T>>>,
 }
 
@@ -46,6 +49,7 @@ impl<T> Debug for Channel<T> {
 struct ChannelState<T> {
     messages: SmallVec<[T; MAX_INLINE_MESSAGES]>, // messages in the channel
     known_senders: usize,                         // number of senders referencing this channel
+    senders_closed: Snapshot,
 }
 
 impl<T> Debug for ChannelState<T> {
@@ -66,9 +70,11 @@ impl<T> Channel<T> {
             bound,
             recv_semaphore,
             send_semaphore,
+            receiver_closed: Notify::new(),
             state: Arc::new(Mutex::new(ChannelState {
                 messages: SmallVec::new(),
                 known_senders: 1,
+                senders_closed: Snapshot::new(),
             })),
         }
     }
@@ -77,6 +83,7 @@ impl<T> Channel<T> {
     // the channel has enough capacity for the send to be successful.
     fn send(&self, message: T) -> Result<(), SendError<T>> {
         if self.is_closed() {
+            self.send_semaphore.join_close_causality();
             return Err(SendError(message));
         }
 
@@ -112,6 +119,7 @@ impl<T> Channel<T> {
             let msg = Some(state.messages.remove(0));
 
             if state.messages.is_empty() && state.known_senders == 0 {
+                let senders_closed = state.senders_closed.clone();
                 trace!(
                     "closing receiving semaphore {:p} for channel {:p} after having drained the channel post last sender drop",
                     self.recv_semaphore,
@@ -121,9 +129,9 @@ impl<T> Channel<T> {
                 // `close` is a scheduling point, so we need to release the lock on `state` here
                 drop(state);
 
-                // To ensure the invariant above; when the receiver picks up the last message
-                // from a channel with no senders, it closes the recv_semaphore
-                self.recv_semaphore.close();
+                shuttle::thread::yield_now();
+                self.recv_semaphore
+                    .close_with_snapshot_no_scheduling_point(&senders_closed);
             }
 
             msg
@@ -141,6 +149,7 @@ impl<T> Channel<T> {
             self
         );
         self.send_semaphore.close();
+        self.receiver_closed.notify_waiters();
     }
 
     fn drop_receiver(&self) {
@@ -173,9 +182,11 @@ impl<T> Channel<T> {
         if known_senders == 0 {
             self.close();
 
-            let no_messages_in_channel = {
-                let state = self.state.try_lock().unwrap();
-                state.messages.is_empty()
+            let (no_messages_in_channel, senders_closed) = {
+                let mut state = self.state.try_lock().unwrap();
+                let snapshot = causal::snapshot();
+                state.senders_closed.update(&snapshot);
+                (state.messages.is_empty(), state.senders_closed.clone())
             };
 
             // If there are messages, then the `recv_semaphore` will remain open until the last message is `recv`d.
@@ -183,7 +194,8 @@ impl<T> Channel<T> {
                 trace!("closing semaphore {:p} on last sender drop", self.recv_semaphore);
                 // See invariant above; when the last sender leaves an empty channel, it
                 // closes the recv_semaphore
-                self.recv_semaphore.close_no_scheduling_point();
+                self.recv_semaphore
+                    .close_with_snapshot_no_scheduling_point(&senders_closed);
             }
         }
     }
@@ -201,36 +213,15 @@ impl<T> Channel<T> {
         self.len() == 0
     }
 
-    fn is_bounded(&self) -> bool {
-        self.bound.is_some()
-    }
-
     // Acquires the capacity for one message, blocking until there is room. Callers of `send` must
     // hold capacity acquired this way, and must return it with `release_capacity` if they end up
     // not sending.
     async fn acquire_capacity(&self) -> Result<(), SendError<()>> {
-        if self.is_bounded() {
-            self.send_semaphore.acquire(1).await.map_err(|_| SendError(()))
-        } else if self.is_closed() {
-            // An unbounded channel does not take capacity from the `send_semaphore` (nothing ever
-            // releases back into it), so the closed check that `acquire` would have done for free
-            // has to happen explicitly.
-            Err(SendError(()))
-        } else {
-            Ok(())
-        }
+        self.send_semaphore.acquire(1).await.map_err(|_| SendError(()))
     }
 
     // Like `acquire_capacity`, but fails instead of blocking if the channel is full.
     fn try_acquire_capacity(&self) -> Result<(), TrySendError<()>> {
-        if !self.is_bounded() {
-            return if self.is_closed() {
-                Err(TrySendError::Closed(()))
-            } else {
-                Ok(())
-            };
-        }
-
         match self.send_semaphore.try_acquire(1) {
             Err(TryAcquireError::Closed) => Err(TrySendError::Closed(())),
             Err(TryAcquireError::NoPermits) => Err(TrySendError::Full(())),
@@ -241,9 +232,7 @@ impl<T> Channel<T> {
     // Returns the capacity for one message to the channel. Called by the receiver once a message
     // has been taken out, and by `Permit`/`OwnedPermit` when a reservation goes unused.
     fn release_capacity(&self) {
-        if self.is_bounded() {
-            self.send_semaphore.release(1);
-        }
+        self.send_semaphore.release(1);
     }
 }
 
@@ -327,6 +316,7 @@ impl<T> ReceiverInternal<T> {
     pub fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>> {
         if self.is_closed() && self.is_empty() {
             self.pending_acquire = None;
+            self.chan.send_semaphore.join_close_causality();
             return Poll::Ready(None);
         }
 
@@ -398,11 +388,8 @@ impl<T> SenderInternal<T> {
 
     /// Sends a value, waiting until there is capacity.
     pub async fn send(&self, message: T) -> Result<(), SendError<T>> {
-        if self.chan.is_bounded() {
-            match self.chan.send_semaphore.acquire(1).await {
-                Ok(()) => {}
-                Err(_) => return Err(SendError(message)),
-            }
+        if self.chan.acquire_capacity().await.is_err() {
+            return Err(SendError(message));
         }
 
         self.chan.send(message)?;
@@ -413,20 +400,30 @@ impl<T> SenderInternal<T> {
 
     /// Completes when the receiver has dropped.
     pub async fn closed(&self) {
-        unimplemented!()
+        loop {
+            let notified = self.chan.receiver_closed.notified();
+            if self.chan.is_closed() {
+                self.chan.send_semaphore.join_close_causality();
+                return;
+            }
+
+            notified.await;
+            if self.chan.is_closed() {
+                return;
+            }
+        }
     }
 
     /// Attempts to immediately send a message on this `Sender`
     pub fn try_send(&self, message: T) -> Result<(), TrySendError<T>> {
-        match self.chan.send_semaphore.try_acquire(1) {
-            Err(TryAcquireError::Closed) => Err(TrySendError::Closed(message)),
-            Err(TryAcquireError::NoPermits) => Err(TrySendError::Full(message)),
-            Ok(()) => {
-                self.chan.send(message)?;
-                self.chan.recv_semaphore.release(1);
-                Ok(())
-            }
+        match self.chan.try_acquire_capacity() {
+            Err(TrySendError::Closed(())) => return Err(TrySendError::Closed(message)),
+            Err(TrySendError::Full(())) => return Err(TrySendError::Full(message)),
+            Ok(()) => {}
         }
+        self.chan.send(message)?;
+        self.chan.recv_semaphore.release(1);
+        Ok(())
     }
 
     /// Blocking send to call outside of asynchronous contexts.

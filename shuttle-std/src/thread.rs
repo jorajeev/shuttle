@@ -1,5 +1,6 @@
 //! Shuttle's implementation of [`std::thread`].
 
+use shuttle_engine::runtime::causality::CausalSnapshot;
 use shuttle_engine::runtime::execution::ExecutionState;
 use shuttle_engine::runtime::task::TaskId;
 use shuttle_engine::runtime::thread;
@@ -57,6 +58,7 @@ impl Thread {
 pub struct Scope<'scope, 'env: 'scope> {
     num_running_threads: AtomicUsize,
     main_task: TaskId,
+    child_tasks: std::sync::Mutex<Vec<TaskId>>,
     scope: PhantomData<&'scope mut &'scope ()>,
     env: PhantomData<&'env mut &'env ()>,
 }
@@ -109,11 +111,13 @@ impl<'scope> Scope<'scope, '_> {
         // To avoid violating this invariant, we pass `switch_before_exit = false` (below). Instead, we provide our own context switch on exit
         // (above) in the `scope_closure` *before* setting `finished` to be `true`.
         // SAFETY: main task is blocked until all scoped closures complete so all captured references remain valid
-        ScopedJoinHandle {
+        let handle = ScopedJoinHandle {
             handle: unsafe { spawn_named_unchecked(scope_closure, None, None, false, Location::caller()) },
             finished,
             _marker: PhantomData,
-        }
+        };
+        self.child_tasks.lock().unwrap().push(handle.handle.task_id);
+        handle
     }
 }
 
@@ -128,6 +132,7 @@ where
     let scope = Scope {
         num_running_threads: AtomicUsize::new(0),
         main_task: ExecutionState::with(|s| s.current().id()),
+        child_tasks: std::sync::Mutex::new(Vec::new()),
         env: PhantomData,
         scope: PhantomData,
     };
@@ -138,6 +143,17 @@ where
         tracing::info!("thread blocked, waiting for completion of scoped threads");
         ExecutionState::with(|s| s.current_mut().block(false));
         thread::switch();
+    }
+
+    let child_tasks = scope.child_tasks.lock().unwrap().clone();
+    if !child_tasks.is_empty() {
+        ExecutionState::with(|state| {
+            let mut completed = CausalSnapshot::new();
+            for task_id in child_tasks {
+                completed.update(&state.get_causality(task_id));
+            }
+            state.update_causality(&completed);
+        });
     }
 
     ret

@@ -135,18 +135,23 @@ impl Config {
     /// Configure an application-defined value to propagate along Shuttle's
     /// modeled happens-before edges.
     ///
-    /// The initial value is installed in the main task's labels. Child tasks
-    /// inherit it, and synchronization operations propagate cloned values using
-    /// `join`. Shuttle does not otherwise modify the value; applications can
-    /// update the current task's value through [`crate::current::with_causal_state`]
-    /// or [`crate::current::set_causal_state`].
+    /// `initial` is called once for each execution. Child tasks inherit a clone
+    /// of their parent's value, and synchronization operations propagate cloned
+    /// values using `join`. Applications add information to the current task's
+    /// value through [`crate::current::causal::join_state`].
+    /// `initial` will usually return the identity for `join`, though it may
+    /// include information deliberately given to every task.
     ///
-    /// Only one causal state type may be configured. `join` should be
-    /// associative, commutative, and idempotent.
+    /// Only one causal state type may be configured. `join` must be
+    /// deterministic, associative, commutative, idempotent, and must never
+    /// remove information. It must not panic, block, perform I/O, or call
+    /// Shuttle APIs. Cloning a value must provide value semantics: mutating one
+    /// clone must not affect another clone.
     #[cfg(feature = "causal-state")]
-    pub fn with_causal_state<T, J>(mut self, initial: T, join: J) -> Self
+    pub fn with_causal_state<T, I, J>(mut self, initial: I, join: J) -> Self
     where
         T: Clone + Send + Sync + 'static,
+        I: Fn() -> T + Send + Sync + 'static,
         J: Fn(&mut T, &T) + Send + Sync + 'static,
     {
         self.causal_state.set(initial, join);

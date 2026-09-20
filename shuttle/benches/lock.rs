@@ -1,6 +1,8 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use shuttle::scheduler::{PctScheduler, RandomScheduler, Scheduler};
 use shuttle::sync::Mutex;
+#[cfg(feature = "causal-state")]
+use shuttle::Config;
 use shuttle::{thread, Runner};
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +38,39 @@ fn lock_benchmark(scheduler: impl Scheduler + 'static, num_tasks: u32, num_event
     });
 }
 
+#[cfg(feature = "causal-state")]
+fn lock_benchmark_with_causal_state(scheduler: impl Scheduler + 'static, num_tasks: u32, num_events_per_task: u32) {
+    #[derive(Clone)]
+    struct Frontier(u64);
+
+    let config = Config::default().with_causal_state(
+        || Frontier(0),
+        |current, incoming| {
+            current.0 |= incoming.0;
+        },
+    );
+    let runner = Runner::new(scheduler, config);
+    runner.run(move || {
+        let lock = Arc::new(Mutex::new(0usize));
+
+        let thds: Vec<_> = (0..num_tasks)
+            .map(|task| {
+                let lock = Arc::clone(&lock);
+                thread::spawn(move || {
+                    shuttle::current::causal::join_state(Frontier(1 << (task % 64)));
+                    for _ in 0..num_events_per_task {
+                        *lock.lock().unwrap() += 1;
+                    }
+                })
+            })
+            .collect();
+
+        for thd in thds {
+            thd.join().unwrap();
+        }
+    });
+}
+
 pub fn lock_sync_benchmark(c: &mut Criterion) {
     let mut g = c.benchmark_group("lock sync");
     g.warm_up_time(Duration::from_secs(1));
@@ -51,6 +86,14 @@ pub fn lock_sync_benchmark(c: &mut Criterion) {
         b.iter(|| {
             let scheduler = RandomScheduler::new_from_seed(0x12345678, ITERATIONS);
             lock_benchmark(scheduler, NARROW_TASKS, NARROW_EVENTS_PER_TASK);
+        });
+    });
+
+    #[cfg(feature = "causal-state")]
+    g.bench_function("random-narrow-causal-state", |b| {
+        b.iter(|| {
+            let scheduler = RandomScheduler::new_from_seed(0x12345678, ITERATIONS);
+            lock_benchmark_with_causal_state(scheduler, NARROW_TASKS, NARROW_EVENTS_PER_TASK);
         });
     });
 

@@ -26,6 +26,7 @@ rt = []
 rt-multi-thread = []
 signal = []
 sync = []
+causal-state = ["shuttle/causal-state"]
 test-util = []
 time = []
 # Unstable feature. Requires `--cfg tokio_unstable` to enable.

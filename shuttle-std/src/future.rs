@@ -21,6 +21,30 @@ use std::task::{Context, Poll, Waker};
 
 pub use shuttle_engine::future::batch_semaphore;
 
+fn abort_task(task_id: TaskId, aborted: &AtomicBool) {
+    thread::switch();
+
+    if aborted.swap(true, Ordering::Relaxed) {
+        return;
+    }
+
+    let res = ExecutionState::try_with(|state| {
+        if state.is_finished() || state.get(task_id).finished() {
+            return;
+        }
+
+        let current = state.current().id();
+        let snapshot = state.increment_causality();
+        if current != task_id {
+            state.update_causality_for_task(task_id, &snapshot);
+        }
+        state.get_mut(task_id).abort();
+    });
+    if let Err(e) = res {
+        tracing::error!("task abort failed with error: {e:?}");
+    }
+}
+
 fn spawn_inner<F>(fut: F, caller: &'static Location<'static>) -> JoinHandle<F::Output>
 where
     F: Future + 'static,
@@ -77,25 +101,7 @@ impl AbortHandle {
     /// The task will be cancelled at the next await point. If the task has already
     /// completed, this is a no-op.
     pub fn abort(&self) {
-        // Scheduling point: the scheduler may run other tasks (including the target)
-        // before the abort flag is set, creating interleavings where the task completes
-        // normally despite an abort() call.
-        thread::switch();
-
-        // Signal the Wrapper to skip the inner future on the next poll.
-        // If already aborted, skip the redundant wake.
-        if self.aborted.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        // Wake the task so Wrapper::poll() runs and performs cleanup.
-        let res = ExecutionState::try_with(|state| {
-            if !state.is_finished() {
-                state.get_mut(self.task_id).abort();
-            }
-        });
-        if let Err(e) = res {
-            tracing::error!("`AbortHandle::abort` failed with error: {e:?}");
-        }
+        abort_task(self.task_id, &self.aborted);
     }
 
     /// Returns `true` if this task is finished, otherwise returns `false`.
@@ -143,25 +149,7 @@ impl<T> JoinHandle<T> {
     /// calling `abort` will return `Err(JoinError::Cancelled)`, unless the task completed
     /// before the abort took effect.
     pub fn abort(&self) {
-        // Scheduling point: the scheduler may run other tasks (including the target)
-        // before the abort flag is set, creating interleavings where the task completes
-        // normally despite an abort() call.
-        thread::switch();
-
-        // Signal the Wrapper to skip the inner future on the next poll.
-        // If already aborted, skip the redundant wake.
-        if self.aborted.swap(true, Ordering::Relaxed) {
-            return;
-        }
-        // Wake the task so Wrapper::poll() runs and performs cleanup.
-        let res = ExecutionState::try_with(|state| {
-            if !state.is_finished() {
-                state.get_mut(self.task_id).abort();
-            }
-        });
-        if let Err(e) = res {
-            tracing::error!("`JoinHandle::abort` failed with error: {e:?}");
-        }
+        abort_task(self.task_id, &self.aborted);
     }
 
     /// Returns `true` if this task is finished, otherwise returns `false`.
