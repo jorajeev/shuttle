@@ -2,7 +2,7 @@ use futures::channel::oneshot;
 use futures::task::{FutureObj, Spawn, SpawnError, SpawnExt as _};
 use futures::{try_join, Future};
 use shuttle::sync::{Barrier, Mutex};
-use shuttle::{check_dfs, check_random, future, scheduler::PctScheduler, thread, Runner};
+use shuttle::{check_dfs, check_random, current, future, scheduler::PctScheduler, thread, Runner};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -37,6 +37,27 @@ fn async_with_join() {
                 future::spawn(async move {
                     assert_eq!(join.await.unwrap(), 42u32);
                 });
+            });
+        },
+        None,
+    );
+}
+
+#[test]
+fn async_join_inherits_vector_clock() {
+    check_dfs(
+        || {
+            future::block_on(async {
+                let flag = Arc::new(shuttle::sync::atomic::AtomicBool::new(false));
+                let handle = {
+                    let flag = Arc::clone(&flag);
+                    future::spawn(async move {
+                        flag.load(shuttle::sync::atomic::Ordering::SeqCst);
+                    })
+                };
+
+                handle.await.unwrap();
+                assert!(current::clock().get(1) > 0);
             });
         },
         None,

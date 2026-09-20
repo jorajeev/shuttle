@@ -11,6 +11,7 @@
 //! Labels can also be used to build customized schedulers: for instance, they can be used to assign
 //! numeric weights to tasks, which can be used to implement a priority-preemptive scheduler.
 
+use crate::runtime::causality::CausalSnapshot;
 #[allow(deprecated)]
 use crate::runtime::execution::TASK_ID_TO_TAGS;
 use crate::runtime::execution::{CurrentSchedule, ExecutionState, LABELS};
@@ -44,6 +45,80 @@ pub fn clock() -> VectorClock {
 /// Gets the clock for the thread with the given task ID
 pub fn clock_for(task_id: TaskId) -> VectorClock {
     ExecutionState::with(|state| state.get_clock(task_id).clone())
+}
+
+/// Get a snapshot of the current task's causal information.
+///
+/// This is an internal API used by Shuttle synchronization primitives.
+#[doc(hidden)]
+pub fn causal_snapshot() -> CausalSnapshot {
+    ExecutionState::with(|state| {
+        let task_id = state.current().id();
+        state.get_causality(task_id)
+    })
+}
+
+/// Get a clone of the application-defined causal state for the current task.
+#[cfg(feature = "causal-state")]
+pub fn causal_state<T>() -> T
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let task_id = me();
+    ExecutionState::with(|state| {
+        assert!(
+            state.config.causal_state.is_type::<T>(),
+            "requested type is not the configured causal state"
+        );
+    });
+    with_labels_for_task(task_id, |labels| {
+        labels
+            .get::<T>()
+            .cloned()
+            .expect("current task has no configured causal state")
+    })
+}
+
+/// Mutate the application-defined causal state for the current task.
+#[cfg(feature = "causal-state")]
+pub fn with_causal_state<T, F, R>(f: F) -> R
+where
+    T: Clone + Send + Sync + 'static,
+    F: FnOnce(&mut T) -> R,
+{
+    let task_id = me();
+    ExecutionState::with(|state| {
+        assert!(
+            state.config.causal_state.is_type::<T>(),
+            "requested type is not the configured causal state"
+        );
+    });
+    with_labels_for_task(task_id, |labels| {
+        let state = labels
+            .get_mut::<T>()
+            .expect("current task has no configured causal state");
+        f(state)
+    })
+}
+
+/// Replace the application-defined causal state for the current task.
+#[cfg(feature = "causal-state")]
+pub fn set_causal_state<T>(value: T) -> T
+where
+    T: Clone + Send + Sync + 'static,
+{
+    let task_id = me();
+    ExecutionState::with(|state| {
+        assert!(
+            state.config.causal_state.is_type::<T>(),
+            "requested type is not the configured causal state"
+        );
+    });
+    with_labels_for_task(task_id, |labels| {
+        labels
+            .insert(value)
+            .expect("current task has no configured causal state")
+    })
 }
 
 /// Apply the given function to the Labels for the specified task

@@ -221,8 +221,14 @@ impl<T> Future for JoinHandle<T> {
     type Output = Result<T, JoinError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let task_id = self.task_id;
         let mut lock = self.inner.lock().unwrap();
         if let Some(result) = lock.result.take() {
+            drop(lock);
+            ExecutionState::with(|state| {
+                let snapshot = state.get_causality(task_id);
+                state.update_causality(&snapshot);
+            });
             Poll::Ready(result)
         } else {
             lock.waker = Some(cx.waker().clone());

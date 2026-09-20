@@ -1,7 +1,7 @@
 use crate::sync::{Mutex, ResourceSignature, ResourceType};
+use shuttle_engine::runtime::causality::CausalSnapshot;
 use shuttle_engine::runtime::execution::ExecutionState;
 use shuttle_engine::runtime::storage::StorageKey;
-use shuttle_engine::runtime::task::clock::VectorClock;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize as StdAtomicUsize, Ordering};
@@ -39,7 +39,7 @@ pub struct Once {
 /// is no longer necessary.
 enum OnceInitState {
     Running(Rc<Mutex<bool>>),
-    Complete(VectorClock),
+    Complete(CausalSnapshot),
 }
 
 impl std::fmt::Debug for OnceInitState {
@@ -108,7 +108,7 @@ impl Once {
                 OnceInitState::Complete(clock) => {
                     let clock = clock.clone();
                     drop(init_state);
-                    state.update_clock(&clock);
+                    state.update_causality(&clock);
                     true
                 }
                 _ => false,
@@ -137,7 +137,7 @@ impl Once {
                     // If already complete, just update the clock from the thread that inited
                     let clock = clock.clone();
                     drop(init_state);
-                    state.update_clock(&clock);
+                    state.update_causality(&clock);
                     None
                 }
                 OnceInitState::Running(lock) => Some(Rc::clone(lock)),
@@ -164,7 +164,7 @@ impl Once {
             // causality with future threads that try (and fail) to run `call_once`. The threads
             // that were racing with us will get causality through acquiring the `Mutex`.
             ExecutionState::with(|state| {
-                let clock = state.increment_clock().clone();
+                let clock = state.increment_causality();
                 *self
                     .get_state(state)
                     .expect("must be initialized by this point")

@@ -1,6 +1,7 @@
 //! A counting semaphore supporting both async and sync operations.
+use crate::runtime::causality::CausalSnapshot;
 use crate::runtime::execution::ExecutionState;
-use crate::runtime::task::{clock::VectorClock, TaskId};
+use crate::runtime::task::TaskId;
 use crate::runtime::thread;
 use crate::sync_types::{ResourceSignature, ResourceType};
 use crate::{backtrace_enabled, current};
@@ -38,11 +39,11 @@ struct Waiter {
     /// when `task_id` is: it is only used to seed the causality of the acquired
     /// permits, and keeping the original enqueue clock is conservative (it can
     /// only add happens-before edges, never remove them).
-    clock: VectorClock,
+    clock: CausalSnapshot,
     waker: Mutex<Option<Waker>>,
 }
 
-// Implement debug in order to not output the `VectorClock`
+// Keep the waiter's causal state out of debug output.
 impl fmt::Debug for Waiter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Waiter")
@@ -65,7 +66,7 @@ impl Waiter {
     /// `unblock_waiters_from_front`, and a scheduling point sits between those two
     /// moments. `task_id`, in contrast, tracks the current poller (see
     /// [`Waiter::task_id`]), so it is read here and refreshed on later polls.
-    fn new(num_permits: usize, clock: VectorClock) -> Self {
+    fn new(num_permits: usize, clock: CausalSnapshot) -> Self {
         Self {
             task_id: AtomicUsize::new(ExecutionState::me().into()),
             num_permits,
@@ -101,14 +102,14 @@ struct PermitsAvailable {
     /// Batches of permits with associated clocks (corresponding to the
     /// `release` events that created them). This is an `Option` because the
     /// deque is lazily initialized; see `const_new`.
-    permit_clocks: Option<VecDeque<(usize, VectorClock)>>,
+    permit_clocks: Option<VecDeque<(usize, CausalSnapshot)>>,
 
     /// The clock of the last successful acquire event. Used for causal
     /// dependence in `try_acquire` failures.
-    last_acquire: VectorClock,
+    last_acquire: CausalSnapshot,
 }
 
-// Implement debug in order to not output the `VectorClock`s
+// Keep permit causal state out of debug output.
 impl fmt::Debug for PermitsAvailable {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PermitsAvailable")
@@ -121,12 +122,12 @@ impl PermitsAvailable {
     fn new(num_permits: usize) -> Self {
         let mut permit_clocks = VecDeque::new();
         if num_permits > 0 {
-            permit_clocks.push_back((num_permits, current::clock()));
+            permit_clocks.push_back((num_permits, current::causal_snapshot()));
         }
         Self {
             num_available: num_permits,
             permit_clocks: Some(permit_clocks),
-            last_acquire: VectorClock::new(),
+            last_acquire: CausalSnapshot::new(),
         }
     }
 
@@ -138,7 +139,7 @@ impl PermitsAvailable {
         Self {
             num_available: num_permits,
             permit_clocks: None,
-            last_acquire: VectorClock::new(),
+            last_acquire: CausalSnapshot::new(),
         }
     }
 
@@ -150,17 +151,21 @@ impl PermitsAvailable {
         if self.permit_clocks.is_none() {
             let mut permit_clocks = VecDeque::new();
             if self.num_available > 0 {
-                permit_clocks.push_back((self.num_available, VectorClock::new()));
+                permit_clocks.push_back((self.num_available, CausalSnapshot::new()));
             }
             self.permit_clocks = Some(permit_clocks);
         }
     }
 
-    fn acquire(&mut self, mut num_permits: usize, acquire_clock: VectorClock) -> Result<VectorClock, TryAcquireError> {
+    fn acquire(
+        &mut self,
+        mut num_permits: usize,
+        acquire_clock: CausalSnapshot,
+    ) -> Result<CausalSnapshot, TryAcquireError> {
         // Acquiring zero permits is always possible, and is not causally
         // dependent on any event.
         if num_permits == 0 {
-            return Ok(VectorClock::new());
+            return Ok(CausalSnapshot::new());
         }
 
         if num_permits <= self.num_available {
@@ -173,7 +178,7 @@ impl PermitsAvailable {
             // is the join of all the batches used (fully or partially), since
             // the acquiry causally depends on the releases that created those
             // batches.
-            let mut clock = VectorClock::new();
+            let mut clock = CausalSnapshot::new();
             let permit_clocks = self.permit_clocks.as_mut().unwrap();
             while let Some((batch_size, batch_clock)) = permit_clocks.front_mut() {
                 clock.update(batch_clock);
@@ -204,7 +209,7 @@ impl PermitsAvailable {
         }
     }
 
-    fn release(&mut self, num_permits: usize, clock: VectorClock) {
+    fn release(&mut self, num_permits: usize, clock: CausalSnapshot) {
         self.init_permit_clocks();
         self.num_available += num_permits;
         self.permit_clocks.as_mut().unwrap().push_back((num_permits, clock));
@@ -264,12 +269,14 @@ impl BatchSemaphoreState {
             //   was woken and selected by the scheduler. In either case, the
             //   thread may succeed, as long as there are enough permits.
 
-            let clock = self.permits_available.acquire(num_permits, current::clock())?;
+            let clock = self
+                .permits_available
+                .acquire(num_permits, current::causal_snapshot())?;
 
             // If successful, the acquiry is causally dependent on the event
             // which released the acquired permits.
             ExecutionState::with(|s| {
-                s.update_clock(&clock);
+                s.update_causality(&clock);
             });
 
             Ok(())
@@ -328,11 +335,12 @@ impl BatchSemaphoreState {
                 assert!(waiter.is_queued.swap(false, Ordering::SeqCst));
                 assert!(!waiter.has_permits.swap(true, Ordering::SeqCst));
                 ExecutionState::with(|s| {
-                    let task = s.get_mut(waiter.task_id());
-                    assert!(!task.finished());
+                    let task_id = waiter.task_id();
+                    assert!(!s.get(task_id).finished());
                     // The acquiry is causally dependent on the event
                     // which released the acquired permits.
-                    task.clock.update(&clock);
+                    s.join_causality_for_task(task_id, &clock);
+                    let task = s.get_mut(task_id);
                     task.unblock();
                 });
                 let mut maybe_waker = waiter.waker.lock().unwrap();
@@ -525,7 +533,7 @@ impl BatchSemaphore {
             // TODO: current permit holders, with a data structure similar to
             // TODO: `permits_available`.
             ExecutionState::with(|s| {
-                s.update_clock(&state.permits_available.last_acquire);
+                s.update_causality(&state.permits_available.last_acquire);
             });
         });
         drop(state);
@@ -639,7 +647,7 @@ impl BatchSemaphore {
             // acquires may succeed, as long as the requesters were not
             // blocking on the semaphore at the time of the panic. This is
             // used to correctly model lock poisoning.
-            state.permits_available.release(num_permits, VectorClock::new());
+            state.permits_available.release(num_permits, CausalSnapshot::new());
             for waiter in &state.waiters {
                 waiter.is_queued.swap(false, Ordering::SeqCst);
             }
@@ -652,8 +660,8 @@ impl BatchSemaphore {
         // clock; future acquires of those permits are causally dependent on
         // this event.
         ExecutionState::with(|s| {
-            let clock = s.increment_clock();
-            state.permits_available.release(num_permits, clock.clone());
+            let snapshot = s.increment_causality();
+            state.permits_available.release(num_permits, snapshot);
         });
 
         // `ExecutionState::me()` is only wanted for this trace, so let the macro's
@@ -751,7 +759,7 @@ pub struct Acquire<'a> {
     /// Snapshotted when this `Acquire` is created, and moved into the `Waiter` if
     /// this acquire ends up blocking. See `Waiter::new` for why the snapshot must
     /// happen here rather than at enqueue time.
-    clock: VectorClock,
+    clock: CausalSnapshot,
 
     /// The shared part of this acquire, allocated only once the acquire has to
     /// block. An acquire that gets its permits immediately is never visible to
@@ -768,7 +776,7 @@ pub struct Acquire<'a> {
     never_polled: bool,
 }
 
-// Implement Debug in order to not output the `VectorClock`, matching `Waiter`.
+// Keep the acquire's causal state out of debug output, matching `Waiter`.
 impl fmt::Debug for Acquire<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Acquire")
@@ -785,7 +793,7 @@ impl<'a> Acquire<'a> {
         Self {
             semaphore,
             num_permits,
-            clock: current::clock(),
+            clock: current::causal_snapshot(),
             waiter: None,
             has_permits: false,
             completed: false,

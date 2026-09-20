@@ -1,3 +1,4 @@
+use crate::runtime::causality::CausalSnapshot;
 use crate::runtime::failure::{init_panic_hook, persist_failure};
 use crate::runtime::storage::{StorageKey, StorageMap};
 use crate::runtime::task::clock::VectorClock;
@@ -519,6 +520,8 @@ impl ExecutionState {
 
                     map.insert(task_id, child_map);
                 }
+            } else {
+                state.config.causal_state.initialize(map.entry(task_id).or_default());
             }
 
             // Add any name assigned to the task to its set of Labels
@@ -858,6 +861,67 @@ impl ExecutionState {
 
     pub fn get_clock_mut(&mut self, id: TaskId) -> &mut VectorClock {
         &mut self.tasks.get_mut(id.0).unwrap().clock
+    }
+
+    /// Get a snapshot of a task's vector clock and application-defined causal state.
+    pub fn get_causality(&self, id: TaskId) -> CausalSnapshot {
+        let clock = self.get_clock(id).clone();
+        if !self.config.causal_state.is_enabled() {
+            return CausalSnapshot::from_clock(clock);
+        }
+        LABELS.with(|cell| {
+            let map = cell.borrow();
+            self.config.causal_state.capture(clock, map.get(&id))
+        })
+    }
+
+    /// Increment the current task's vector clock and snapshot its causal state.
+    pub fn increment_causality(&mut self) -> CausalSnapshot {
+        let clock = self.increment_clock().clone();
+        if !self.config.causal_state.is_enabled() {
+            return CausalSnapshot::from_clock(clock);
+        }
+        let task_id = self.current().id();
+        LABELS.with(|cell| {
+            let map = cell.borrow();
+            self.config.causal_state.capture(clock, map.get(&task_id))
+        })
+    }
+
+    /// Increment the current task and join a causal snapshot into it.
+    pub fn update_causality(&mut self, snapshot: &CausalSnapshot) {
+        self.update_clock(snapshot.clock());
+        if self.config.causal_state.is_enabled() {
+            let task_id = self.current().id();
+            self.merge_causal_state(task_id, snapshot);
+        }
+    }
+
+    /// Join a causal snapshot into a task without incrementing its vector clock.
+    pub fn join_causality_for_task(&mut self, task_id: TaskId, snapshot: &CausalSnapshot) {
+        self.get_clock_mut(task_id).update(snapshot.clock());
+        self.merge_causal_state(task_id, snapshot);
+    }
+
+    /// Increment a task and join a causal snapshot into it.
+    pub fn update_causality_for_task(&mut self, task_id: TaskId, snapshot: &CausalSnapshot) {
+        {
+            let task = self.get_mut(task_id);
+            task.clock.increment(task_id);
+            task.clock.update(snapshot.clock());
+        }
+        self.merge_causal_state(task_id, snapshot);
+    }
+
+    fn merge_causal_state(&self, task_id: TaskId, snapshot: &CausalSnapshot) {
+        if !self.config.causal_state.is_enabled() {
+            return;
+        }
+        LABELS.with(|cell| {
+            let mut map = cell.borrow_mut();
+            let labels = map.entry(task_id).or_default();
+            self.config.causal_state.merge_into_labels(labels, snapshot);
+        });
     }
 
     /// Increment the current thread's clock entry and update its clock with the one provided.

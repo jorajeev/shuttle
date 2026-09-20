@@ -1,6 +1,6 @@
 use crate::sync::{ResourceSignature, ResourceType};
+use shuttle_engine::runtime::causality::CausalSnapshot;
 use shuttle_engine::runtime::execution::ExecutionState;
-use shuttle_engine::runtime::task::clock::VectorClock;
 use shuttle_engine::runtime::task::TaskId;
 use shuttle_engine::runtime::thread;
 use std::cell::RefCell;
@@ -53,10 +53,10 @@ struct BarrierState {
     /// unblocked, but haven't had a leader selected yet. The first thread to wake up after wait
     /// will take the token (by removing the epoch from the set) and become the leader.
     leader_tokens: HashSet<u64>,
-    clock: VectorClock,
+    clock: CausalSnapshot,
 }
 
-// Implement debug in order to not output the `VectorClock`
+// Keep the aggregate causal state out of debug output.
 impl fmt::Debug for BarrierState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BarrierState")
@@ -87,7 +87,7 @@ impl Barrier {
             epoch: 0,
             waiters: HashSet::new(),
             leader_tokens: HashSet::new(),
-            clock: VectorClock::new(),
+            clock: CausalSnapshot::new(),
         };
 
         Self {
@@ -121,10 +121,10 @@ impl Barrier {
 
         trace!(waiters=?state.waiters, epoch=my_epoch, "waiting on barrier {:p}", self);
 
-        // Update the barrier's clock with the clock of this thread
+        // Join this task's causal state into the barrier.
         ExecutionState::with(|s| {
-            let clock = s.increment_clock();
-            state.clock.update(clock);
+            let snapshot = s.increment_causality();
+            state.clock.update(&snapshot);
         });
 
         // Add the current thread to `waiters`. It shouldn't already be present.
@@ -160,9 +160,8 @@ impl Barrier {
             ExecutionState::with(|s| {
                 // `waiters` includes the current task.
                 for tid in waiters {
+                    s.update_causality_for_task(tid, &clock);
                     let t = s.get_mut(tid);
-                    t.clock.increment(tid);
-                    t.clock.update(&clock);
                     t.unblock();
                 }
             });

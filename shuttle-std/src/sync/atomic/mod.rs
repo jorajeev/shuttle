@@ -60,8 +60,8 @@ pub use ptr::AtomicPtr;
 pub use std::sync::atomic::Ordering;
 
 use crate::sync::{ResourceSignature, ResourceType};
+use shuttle_engine::runtime::causality::CausalSnapshot;
 use shuttle_engine::runtime::execution::ExecutionState;
-use shuttle_engine::runtime::task::clock::VectorClock;
 use shuttle_engine::runtime::thread;
 use shuttle_engine::silence_warnings;
 use std::cell::RefCell;
@@ -120,7 +120,7 @@ pub use std::sync::atomic::compiler_fence;
 #[derive(Debug)]
 struct Atomic<T> {
     inner: RefCell<T>,
-    clock: RefCell<Option<VectorClock>>, // wrapped in option to support the const new()
+    clock: RefCell<Option<CausalSnapshot>>, // wrapped in option to support the const new()
     #[allow(unused)]
     signature: ResourceSignature,
 }
@@ -214,7 +214,7 @@ impl<T: Copy + Eq> Atomic<T> {
     }
 
     fn init_clock(&self) {
-        self.clock.borrow_mut().get_or_insert(VectorClock::new());
+        self.clock.borrow_mut().get_or_insert(CausalSnapshot::new());
     }
 
     // Increment the clock for the current thread, and update the Atomic's clock with it
@@ -222,9 +222,9 @@ impl<T: Copy + Eq> Atomic<T> {
     fn inhale_clock(&self) {
         self.init_clock();
         ExecutionState::with(|s| {
-            let clock = s.increment_clock();
+            let clock = s.increment_causality();
             let mut self_clock = self.clock.borrow_mut();
-            self_clock.as_mut().unwrap().update(clock);
+            self_clock.as_mut().unwrap().update(&clock);
         });
     }
 
@@ -234,7 +234,7 @@ impl<T: Copy + Eq> Atomic<T> {
         self.init_clock();
         ExecutionState::with(|s| {
             let self_clock = self.clock.borrow();
-            s.update_clock(self_clock.as_ref().unwrap());
+            s.update_causality(self_clock.as_ref().unwrap());
         });
     }
 

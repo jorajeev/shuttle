@@ -1,5 +1,7 @@
 # Unreleased
 
+* Add the optional `causal-state` feature for propagating one application-defined, joinable value through task creation and modeled synchronization edges. The current value is stored in task labels and can be read or updated through `shuttle::current`.
+
 * Performance: `BatchSemaphore` no longer takes a `std::sync::Mutex` in a release-mode assertion on every `Acquire` poll, and allocates its `Waiter` only when an acquire actually blocks. Uncontended synchronization operations (`Mutex`, `RwLock`, `Semaphore`, channels) are 43-50% faster.
 
 * Performance: `backtrace_enabled` no longer reads the environment on every call. It is called from `Task::block` and `Task::sleep`, so on every block and every `Poll::Pending`, and `std::env::var` takes a lock on the environment and allocates. Lock-heavy workloads are 9-12% faster.

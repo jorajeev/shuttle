@@ -1,8 +1,8 @@
 //! Multi-producer, single-consumer FIFO queue communication primitives.
 
 use crate::sync::{ResourceSignature, ResourceType};
+use shuttle_engine::runtime::causality::CausalSnapshot;
 use shuttle_engine::runtime::execution::ExecutionState;
-use shuttle_engine::runtime::task::clock::VectorClock;
 use shuttle_engine::runtime::task::{TaskId, DEFAULT_INLINE_TASKS};
 use shuttle_engine::runtime::thread;
 use smallvec::SmallVec;
@@ -51,32 +51,28 @@ struct Channel<T> {
     signature: ResourceSignature,
 }
 
-// For tracking causality on channels, we timestamp each message with the clock of the sender.
-// When the receiver gets the message, it updates its clock with the the associated timestamp.
+// For tracking causality on channels, we timestamp each message with the sender's causal state.
+// When the receiver gets the message, it joins the associated snapshot into its own state.
 // For unbounded channels, that's all the work we need to do.
 //
 // For bounded and rendezvous channels, things get a bit more interesting.
 // Consider a bounded channel of depth K.  As soon as the sender successfully sends its K+1'th
 // message, it knows that the receiver has received at least 1 message.  At this point, the
-// first receive event causally precedes the (K+1)'th send.  By the rule for vector clocks,
-//  (clock of the first receive)  <  (clock of the K+1'th send)
-// In order to ensure this ordering, we add a return queue of depth K to bounded channels.
-// Initially, this queue contains K empty vector clocks.  On each receive, we push the
-// receiver's clock at the time of the receive to the end of this queue.  Whenever the sender
-// successfully sends a message, it pops the clock at the front of the queue, and updates its
-// own clock with this value.  Thus, on the (K+1)'th send, the sender's clock will be updated
-// with the clock at the first receive, as needed.
+// first receive event causally precedes the (K+1)'th send. To propagate that edge, bounded
+// channels have a return queue of depth K. Initially, it contains K empty snapshots. On each
+// receive, we push the receiver's state to the back. A successful send pops the front snapshot
+// and joins it into the sender's state.
 //
 // The story is similar for rendezvous channels, except we have to handle things a bit more
 // specially because K=0.
 
 struct TimestampedValue<T> {
     value: T,
-    clock: VectorClock,
+    clock: CausalSnapshot,
 }
 
 impl<T> TimestampedValue<T> {
-    fn new(value: T, clock: VectorClock) -> Self {
+    fn new(value: T, clock: CausalSnapshot) -> Self {
         Self { value, clock }
     }
 }
@@ -86,11 +82,11 @@ impl<T> TimestampedValue<T> {
 // and Receivers can share a single channel.
 struct ChannelState<T> {
     messages: SmallVec<[TimestampedValue<T>; MAX_INLINE_MESSAGES]>, // messages in the channel
-    receiver_clock: Option<SmallVec<[VectorClock; MAX_INLINE_MESSAGES]>>, // receiver vector clocks for bounded case
-    known_senders: usize,                                           // number of senders referencing this channel
-    known_receivers: usize,                                         // number or receivers referencing this channel
-    waiting_senders: SmallVec<[TaskId; DEFAULT_INLINE_TASKS]>,      // list of currently blocked senders
-    waiting_receivers: SmallVec<[TaskId; DEFAULT_INLINE_TASKS]>,    // list of currently blocked receivers
+    receiver_clock: Option<SmallVec<[CausalSnapshot; MAX_INLINE_MESSAGES]>>, // receiver causal snapshots for bounded case
+    known_senders: usize,   // number of senders referencing this channel
+    known_receivers: usize, // number or receivers referencing this channel
+    waiting_senders: SmallVec<[TaskId; DEFAULT_INLINE_TASKS]>, // list of currently blocked senders
+    waiting_receivers: SmallVec<[TaskId; DEFAULT_INLINE_TASKS]>, // list of currently blocked receivers
 }
 
 impl<T> Debug for ChannelState<T> {
@@ -114,7 +110,7 @@ impl<T> Channel<T> {
         let receiver_clock = if let Some(bound) = bound {
             let mut s = SmallVec::with_capacity(bound);
             for _ in 0..bound {
-                s.push(VectorClock::new());
+                s.push(CausalSnapshot::new());
             }
             Some(s)
         } else {
@@ -224,8 +220,8 @@ impl<T> Channel<T> {
         }
 
         ExecutionState::with(|s| {
-            let clock = s.increment_clock();
-            state.messages.push(TimestampedValue::new(message, clock.clone()));
+            let snapshot = s.increment_causality();
+            state.messages.push(TimestampedValue::new(message, snapshot));
         });
 
         // The sender has just added a message to the channel, so unblock the first waiting receiver if any
@@ -236,8 +232,8 @@ impl<T> Channel<T> {
                 // When a sender successfully sends on a rendezvous channel, it knows that the receiver will perform
                 // the matching receive, so we need to update the sender's clock with the receiver's.
                 if self.is_rendezvous() {
-                    let recv_clock = s.get_clock(tid).clone();
-                    s.update_clock(&recv_clock);
+                    let recv_snapshot = s.get_causality(tid);
+                    s.update_causality(&recv_snapshot);
                 }
             });
         }
@@ -252,7 +248,7 @@ impl<T> Channel<T> {
         if !self.is_rendezvous() {
             if let Some(receiver_clock) = &mut state.receiver_clock {
                 let recv_clock = receiver_clock.remove(0);
-                ExecutionState::with(|s| s.update_clock(&recv_clock));
+                ExecutionState::with(|s| s.update_causality(&recv_clock));
             }
         }
 
@@ -381,11 +377,11 @@ impl<T> Channel<T> {
             }
         }
 
-        // Update receiver clock from the clock attached to the message received
+        // Join the snapshot attached to the received message into the receiver.
         let TimestampedValue { value, clock } = item;
         ExecutionState::with(|s| {
             // Since we already incremented the receiver's clock above, just update it here
-            s.get_clock_mut(me).update(&clock);
+            s.join_causality_for_task(me, &clock);
 
             // If this is a (non-rendezvous) bounded channel, propagate causality backwards to sender
             if let Some(receiver_clock) = &mut state.receiver_clock {
@@ -393,7 +389,7 @@ impl<T> Channel<T> {
                 if bound > 0 {
                     // non-rendezvous
                     assert!(receiver_clock.len() < bound);
-                    receiver_clock.push(s.get_clock(me).clone());
+                    receiver_clock.push(s.get_causality(me));
                 }
             }
         });
@@ -666,5 +662,31 @@ mod tests {
             },
             1,
         );
+    }
+
+    #[cfg(feature = "causal-state")]
+    #[test]
+    fn custom_causal_state_without_vector_clocks() {
+        use shuttle_engine::{Config, Runner};
+        use shuttle_schedulers::RoundRobinScheduler;
+
+        #[derive(Clone, Copy)]
+        struct Bits(u8);
+
+        let config = Config::default().with_causal_state(Bits(1), |current, incoming| {
+            current.0 |= incoming.0;
+        });
+
+        Runner::new(RoundRobinScheduler::new(1), config).run(|| {
+            let (tx, rx) = channel();
+            let child = crate::thread::spawn(move || {
+                shuttle_engine::current::set_causal_state(Bits(2));
+                tx.send(()).unwrap();
+            });
+
+            rx.recv().unwrap();
+            assert_eq!(shuttle_engine::current::causal_state::<Bits>().0, 3);
+            child.join().unwrap();
+        });
     }
 }

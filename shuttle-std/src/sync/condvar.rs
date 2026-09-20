@@ -1,8 +1,8 @@
 use crate::sync::{MutexGuard, ResourceSignature, ResourceType};
 use assoc::AssocExt;
 use shuttle_engine::current;
+use shuttle_engine::runtime::causality::CausalSnapshot;
 use shuttle_engine::runtime::execution::ExecutionState;
-use shuttle_engine::runtime::task::clock::VectorClock;
 use shuttle_engine::runtime::task::TaskId;
 use shuttle_engine::runtime::thread;
 use std::cell::RefCell;
@@ -27,14 +27,14 @@ struct CondvarState {
     next_epoch: usize,
 }
 
-// For tracking causal dependencies, we record the clock C of the thread that does the notify.
-// When a thread is unblocked, its clock is updated by C.
-#[derive(PartialEq, Eq, Debug)]
+// For tracking causal dependencies, we record the notifier's causal state. When a task is
+// unblocked, that state is joined into its own.
+#[derive(Debug)]
 enum CondvarWaitStatus {
     Waiting,
     // invariant: VecDeque is non-empty (if it's empty, we should be Waiting instead)
-    Signal(VecDeque<(usize, VectorClock)>),
-    Broadcast(VectorClock),
+    Signal(VecDeque<(usize, CausalSnapshot)>),
+    Broadcast(CausalSnapshot),
 }
 
 // TODO Check if we can avoid using epochs now that we have vector clocks.
@@ -160,8 +160,8 @@ impl Condvar {
         let my_status = <_ as AssocExt<_, _>>::remove(&mut state.waiters, &me).expect("should be waiting");
         match my_status {
             CondvarWaitStatus::Broadcast(clock) => {
-                // Woken by a broadcast, so nothing to do except update the clock
-                ExecutionState::with(|s| s.update_clock(&clock));
+                // Woken by a broadcast, so join the notifier's state.
+                ExecutionState::with(|s| s.update_causality(&clock));
             }
             CondvarWaitStatus::Signal(mut epochs) => {
                 let (epoch, clock) = epochs.pop_front().expect("should be a pending signal");
@@ -180,8 +180,8 @@ impl Condvar {
                         }
                     }
                 }
-                // Update the thread's clock with the clock from the notifier
-                ExecutionState::with(|s| s.update_clock(&clock));
+                // Join the notifier's state into the woken task.
+                ExecutionState::with(|s| s.update_causality(&clock));
             }
             CondvarWaitStatus::Waiting => panic!("should not have been woken while in Waiting status"),
         }
@@ -253,7 +253,7 @@ impl Condvar {
         for (tid, status) in state.waiters.iter_mut() {
             assert_ne!(*tid, me);
 
-            let clock = current::clock();
+            let clock = current::causal_snapshot();
             match status {
                 CondvarWaitStatus::Waiting => {
                     let mut epochs = VecDeque::new();
@@ -288,7 +288,7 @@ impl Condvar {
 
         for (tid, status) in state.waiters.iter_mut() {
             assert_ne!(*tid, me);
-            *status = CondvarWaitStatus::Broadcast(current::clock());
+            *status = CondvarWaitStatus::Broadcast(current::causal_snapshot());
             // Note: the task might have been unblocked by a previous signal
             ExecutionState::with(|s| s.get_mut(*tid).unblock());
         }

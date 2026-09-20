@@ -18,3 +18,4 @@ shuttle-schedulers = { path = "../shuttle-schedulers" }
 
 [features]
 default = []
+causal-state = ["shuttle-engine/causal-state"]

@@ -1,9 +1,12 @@
+use crate::runtime::causality::CausalStateConfig;
 use std::cell::Cell;
 
 /// Configuration parameters for Shuttle
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Config {
+    pub(crate) causal_state: CausalStateConfig,
+
     /// Stack size allocated for each thread
     pub stack_size: usize,
 
@@ -118,6 +121,7 @@ impl Config {
     /// Create a new default configuration
     pub fn new() -> Self {
         Self {
+            causal_state: CausalStateConfig::default(),
             stack_size: 0xf000,
             failure_persistence: FailurePersistence::Print,
             max_steps: MaxSteps::FailAfter(1_000_000),
@@ -126,6 +130,27 @@ impl Config {
             record_steps_in_span: false,
             ungraceful_shutdown_config: UngracefulShutdownConfig::default(),
         }
+    }
+
+    /// Configure an application-defined value to propagate along Shuttle's
+    /// modeled happens-before edges.
+    ///
+    /// The initial value is installed in the main task's labels. Child tasks
+    /// inherit it, and synchronization operations propagate cloned values using
+    /// `join`. Shuttle does not otherwise modify the value; applications can
+    /// update the current task's value through [`crate::current::with_causal_state`]
+    /// or [`crate::current::set_causal_state`].
+    ///
+    /// Only one causal state type may be configured. `join` should be
+    /// associative, commutative, and idempotent.
+    #[cfg(feature = "causal-state")]
+    pub fn with_causal_state<T, J>(mut self, initial: T, join: J) -> Self
+    where
+        T: Clone + Send + Sync + 'static,
+        J: Fn(&mut T, &T) + Send + Sync + 'static,
+    {
+        self.causal_state.set(initial, join);
+        self
     }
 }
 

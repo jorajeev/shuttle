@@ -279,11 +279,10 @@ impl<T> JoinHandle<T> {
             thread::switch();
         }
 
-        // Waiting thread inherits the clock of the finished thread
+        // The waiting task inherits the causal state of the finished task.
         ExecutionState::with(|state| {
-            let target = state.get_mut(self.task_id);
-            let clock = target.clock.clone();
-            state.update_clock(&clock);
+            let snapshot = state.get_causality(self.task_id);
+            state.update_causality(&snapshot);
         });
 
         self.result.lock().unwrap().take().expect("target should have finished")

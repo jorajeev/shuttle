@@ -1,3 +1,4 @@
+pub mod causality;
 pub mod execution;
 mod failure;
 pub mod runner;
