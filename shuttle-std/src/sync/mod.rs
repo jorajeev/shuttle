@@ -5,6 +5,7 @@ pub mod mpsc;
 mod mutex;
 mod once;
 mod rwlock;
+mod tracked_cell;
 
 pub use barrier::{Barrier, BarrierWaitResult};
 pub use condvar::{Condvar, WaitTimeoutResult};
@@ -18,6 +19,8 @@ pub use once::OnceState;
 pub use rwlock::RwLock;
 pub use rwlock::RwLockReadGuard;
 pub use rwlock::RwLockWriteGuard;
+
+pub use tracked_cell::TrackedCell;
 
 pub use std::sync::{LockResult, PoisonError, TryLockError, TryLockResult};
 

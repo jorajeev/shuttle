@@ -31,6 +31,8 @@ pub enum ResourceType {
     RwLock,
     Once,
     MpscChannel,
+    /// A `TrackedCell`, which holds the shared state of a primitive that a wrapper implements.
+    TrackedCell,
 }
 
 #[allow(unused)]

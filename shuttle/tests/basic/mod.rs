@@ -27,4 +27,5 @@ mod teardown;
 mod thread;
 mod timeout;
 mod tracing;
+mod tracked_cell;
 mod uncontrolled_nondeterminism;
