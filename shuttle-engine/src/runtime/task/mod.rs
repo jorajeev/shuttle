@@ -215,7 +215,15 @@ impl TaskSignature {
 
     #[track_caller]
     pub fn new_resource(&mut self, resource_type: ResourceType) -> ResourceSignature {
-        let static_create_location = Location::caller();
+        self.new_resource_at(resource_type, Location::caller())
+    }
+
+    /// Like `new_resource`, for a resource created at `static_create_location`.
+    pub fn new_resource_at(
+        &mut self,
+        resource_type: ResourceType,
+        static_create_location: &'static Location<'static>,
+    ) -> ResourceSignature {
         let counter = self
             .child_counters
             .entry(static_create_location)

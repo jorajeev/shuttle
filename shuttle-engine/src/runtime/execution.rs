@@ -2114,7 +2114,9 @@ impl ExecutionState {
 
     #[track_caller]
     pub fn new_resource_signature(resource_type: ResourceType) -> ResourceSignature {
-        ExecutionState::with(|s| s.current_mut().signature.new_resource(resource_type))
+        // `#[track_caller]` doesn't reach into closures, so take the caller's location out here.
+        let location = Location::caller();
+        ExecutionState::with(|s| s.current_mut().signature.new_resource_at(resource_type, location))
     }
 
     pub fn get_storage<K: Into<StorageKey>, T: 'static>(&self, key: K) -> Option<&T> {

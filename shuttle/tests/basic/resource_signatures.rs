@@ -39,3 +39,26 @@ fn batch_semaphore_signatures_consistent_across_shuttle_iterations() {
 
     assert_eq!(all_signatures.lock().unwrap().len(), 2);
 }
+
+/// A resource's signature records where the resource was created, so resources created at different
+/// call sites in the same task have different creation locations.
+#[test]
+fn resource_signatures_record_their_call_site() {
+    check_random(
+        || {
+            let sem1 = BatchSemaphore::new(1, Fairness::Unfair);
+            let sem2 = BatchSemaphore::new(1, Fairness::Unfair);
+            assert_ne!(
+                sem1.signature().static_create_location_hash(),
+                sem2.signature().static_create_location_hash()
+            );
+            assert!(
+                sem1.signature().to_string().contains(file!()),
+                "{} doesn't name {}",
+                sem1.signature(),
+                file!()
+            );
+        },
+        1,
+    );
+}
