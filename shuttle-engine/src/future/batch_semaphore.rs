@@ -851,9 +851,11 @@ impl BatchSemaphore {
         self.release_no_scheduling_point(num_permits);
     }
 
-    /// `release` without its scheduling point.
+    /// Releases `num_permits` back to the semaphore without invoking `thread::switch`, for a caller
+    /// that has already taken the scheduling point for the operation that the release is part of
+    /// (e.g., a channel that pushes a message and then releases a permit for it, in one step).
     #[inline]
-    fn release_no_scheduling_point(&self, num_permits: usize) {
+    pub fn release_no_scheduling_point(&self, num_permits: usize) {
         self.init_object_id();
         if num_permits == 0 {
             return;

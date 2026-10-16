@@ -428,6 +428,57 @@ pub fn switch() {
     }
 }
 
+/// Like `switch`, for a scheduling point in a `Drop` implementation, before the destructor accesses
+/// shared state (e.g., a channel's sender count when a sender is dropped).
+///
+/// A destructor can run where there is no task to switch: outside of a Shuttle execution (a value
+/// that outlives its test, say), or while Shuttle holds its own state borrowed. There it does
+/// nothing. Everywhere else it is a plain `switch`, also while the task unwinds a panic and during
+/// execution teardown, which Shuttle supports: a task that switches out while it unwinds is resumed
+/// to finish unwinding, and teardown, which schedules nothing, only lets a destructor switch out
+/// when it has to wait.
+#[track_caller]
+#[inline]
+pub fn drop_scheduling_point() {
+    if ExecutionState::try_with(|_| ()).is_ok() {
+        switch();
+    }
+}
+
+/// A scheduling point that a future takes on its first poll only, for a future that reads shared
+/// state when it's polled. Call [`FirstPollSwitch::switch`] at the start of `poll`, before the
+/// first access.
+///
+/// The first poll can come at any point of the polling task's step, so it needs a scheduling point
+/// of its own. A later poll follows a wake-up, at the start of a step that begins at the scheduling
+/// point between two polls of the task (see `Task::from_future`) or in `block_on`. That doesn't
+/// hold if the future is polled again in the same poll as other futures that access shared state
+/// (in a `select!`, say), which this doesn't cover.
+#[derive(Debug, Default)]
+pub struct FirstPollSwitch {
+    polled: bool,
+}
+
+impl FirstPollSwitch {
+    /// A `FirstPollSwitch` for a future that hasn't been polled yet.
+    pub const fn new() -> Self {
+        Self { polled: false }
+    }
+
+    /// Switches if this is the first call, and does nothing on later calls. Returns whether it was
+    /// the first call.
+    #[track_caller]
+    #[inline]
+    pub fn switch(&mut self) -> bool {
+        if self.polled {
+            return false;
+        }
+        self.polled = true;
+        switch();
+        true
+    }
+}
+
 /// Like `switch`, for the loop that polls a future task's future (see `Task::from_future`), between
 /// two polls. Returns true if execution teardown cancelled the task while it was switched out (see
 /// `Continuation::cancel`), in which case the loop drops the future instead of polling it again.

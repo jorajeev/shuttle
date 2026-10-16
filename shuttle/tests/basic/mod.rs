@@ -20,6 +20,7 @@ mod replay;
 mod resource_signatures;
 mod rwlock;
 mod scheduling_point_checker;
+mod scheduling_point_helpers;
 mod shrink;
 mod tag;
 mod task;
