@@ -570,8 +570,7 @@ impl BatchSemaphore {
     /// holds the semaphore (see [`BatchSemaphore::acquire_reserving`]), this is
     /// zero: the available permits are kept for the holder.
     pub fn available_permits(&self) -> usize {
-        // TODO: Report this read to the scheduling-point checker (see `record_access`) once queries
-        // take a scheduling point before they read the state, which is still open (see #262).
+        self.record_access(AccessKind::Read);
         let state = self.state.borrow();
         state.available()
     }
@@ -628,8 +627,7 @@ impl BatchSemaphore {
 
     /// Returns true iff the semaphore is closed.
     pub fn is_closed(&self) -> bool {
-        // TODO: Report this read to the scheduling-point checker (see `record_access`) once queries
-        // take a scheduling point before they read the state, which is still open (see #262).
+        self.record_access(AccessKind::Read);
         let state = self.state.borrow();
         state.closed
     }
@@ -1295,7 +1293,9 @@ impl Future for Acquire<'_> {
             self.completed = true;
             trace!("Acquire::poll for {:?} with permits", self);
             Poll::Ready(Ok(()))
-        } else if self.semaphore.is_closed() {
+        } else if self.semaphore.state.borrow().closed {
+            // Not `is_closed`, which reports a read: this poll's operation was reported above, or is
+            // exempt.
             assert!(!self.is_queued());
             self.completed = true;
             trace!("Acquire::poll for {:?} with closed", self);
