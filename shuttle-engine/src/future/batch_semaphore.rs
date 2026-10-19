@@ -866,13 +866,13 @@ impl BatchSemaphore {
 
         crate::annotations::record_semaphore_release(state.id.unwrap(), num_permits);
 
-        if ExecutionState::should_stop() {
-            // In case we are panicking, we release permits, but also clear
-            // the waiters queue: we should not unblock the threads at this
-            // point. However, the permits are released such that future
-            // acquires may succeed, as long as the requesters were not
-            // blocking on the semaphore at the time of the panic. This is
-            // used to correctly model lock poisoning.
+        // A task that releases while it panics (a lock guard dropped while unwinding, say) releases
+        // as usual, because the panic may be caught, and the execution go on. (Shuttle's `Mutex` and
+        // `RwLock` report poisoning from the std locks inside them.) But if the execution has
+        // stopped, or its state is borrowed, the waiters can't be unblocked. We release the permits
+        // then, but clear the waiters queue, and close the semaphore.
+        let stopped = ExecutionState::should_stop() && !ExecutionState::try_with(|s| !s.stops(false)).unwrap_or(false);
+        if stopped {
             state.permits_available.release(num_permits, VectorClock::new());
             for waiter in &state.waiters {
                 waiter.is_queued.swap(false, Ordering::SeqCst);
