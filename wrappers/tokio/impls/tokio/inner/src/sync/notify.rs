@@ -8,7 +8,7 @@ use pin_project::{pin_project, pinned_drop};
 use shuttle::rand::{rngs::ThreadRng, thread_rng, Rng};
 use shuttle::sync::TrackedCell;
 use shuttle_engine::runtime::execution::ExecutionState;
-use shuttle_engine::runtime::thread;
+use shuttle_engine::runtime::thread::{self, drop_scheduling_point, FirstPollSwitch};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
@@ -59,7 +59,12 @@ impl NotifyState {
 // Encode worker state in usize
 const INIT: usize = 0; // not yet polled or enabled
 const ENABLED: usize = 1; // enabled but not notified
-const NOTIFIED: usize = 2; // notified
+const NOTIFIED_ONE: usize = 2; // notified by `notify_one`, or took a stored permit
+const NOTIFIED_ALL: usize = 3; // notified by `notify_waiters`
+
+fn is_notified(flag: usize) -> bool {
+    flag == NOTIFIED_ONE || flag == NOTIFIED_ALL
+}
 
 #[derive(Debug)]
 struct Waiter {
@@ -82,6 +87,10 @@ pub struct Notified<'a> {
     // oneshot being awaited on
     #[pin]
     rx: oneshot::Receiver<()>,
+    // The scheduling point before the first poll or `enable`
+    first_poll: FirstPollSwitch,
+    // Whether this future has completed, after which it's notified for good
+    done: bool,
 }
 
 unsafe impl Send for Notified<'_> {}
@@ -128,6 +137,8 @@ impl Notify {
             flag,
             notify: self,
             rx,
+            first_poll: FirstPollSwitch::new(),
+            done: false,
         }
     }
 
@@ -138,42 +149,48 @@ impl Notify {
     /// [`notified().await`] will complete immediately consuming the permit made
     /// available by this call to `notify_one()`.
     pub fn notify_one(&self) {
+        // Scheduling point before the operation, which can store a permit or notify a waiter.
+        thread::switch();
         // In tokio, `notify_one` chooses a waiter and marks it notified under the lock of the
         // waiter list, so it's one operation on the `Notify`, of which the waiters' flags are part.
-        let waiter = ExecutionState::atomic_step(|| {
-            let mut state = self.state.borrow_mut();
-            // Need to choose a waiter that is Pending
-            let mut pending = Vec::with_capacity(state.waiters.len());
-            for w in &state.waiters {
-                let flag = w.flag.get();
-                assert!(flag == INIT || flag == ENABLED);
-                if flag == ENABLED {
-                    pending.push(w.id);
-                }
-            }
-            trace!("notify_one for {:p} notifying waiters {:?}", self, pending);
-            if pending.is_empty() {
-                // No pending waiters, so just record the fact that a notify is pending
-                state.pending = true;
-                None
-            } else {
-                // Choose a pending waiter at random
-                let index = state.rng.gen_range(0..pending.len());
-                let id = pending[index];
-                // Remove waiter and mark it notified
-                let waiter = state.remove_waiter(id);
-                state.pending = false;
-                drop(state);
-                // Must set flag before notifying waiter.
-                waiter.flag.set(NOTIFIED);
-                Some(waiter)
-            }
-        });
+        let waiter = ExecutionState::atomic_step(|| self.notify_one_step());
         if let Some(waiter) = waiter {
             trace!("notify_one for {:?} waking waiter {:?}", self, waiter.id);
             // The send may fail if the Notified future is dropped between the flag store
-            // and the send (the flag is already NOTIFIED, so the future already completed).
+            // and the send. Its destructor then passes the notification on.
             let _ = waiter.tx.send(());
+        }
+    }
+
+    /// The operation of `notify_one`: chooses a waiter and marks it notified, or stores a permit if
+    /// there's none. Returns the waiter to wake, if any. Must be called in an `atomic_step`.
+    fn notify_one_step(&self) -> Option<Waiter> {
+        let mut state = self.state.borrow_mut();
+        // Need to choose a waiter that is Pending
+        let mut pending = Vec::with_capacity(state.waiters.len());
+        for w in &state.waiters {
+            let flag = w.flag.get();
+            assert!(flag == INIT || flag == ENABLED);
+            if flag == ENABLED {
+                pending.push(w.id);
+            }
+        }
+        trace!("notify_one for {:p} notifying waiters {:?}", self, pending);
+        if pending.is_empty() {
+            // No pending waiters, so just record the fact that a notify is pending
+            state.pending = true;
+            None
+        } else {
+            // Choose a pending waiter at random
+            let index = state.rng.gen_range(0..pending.len());
+            let id = pending[index];
+            // Remove waiter and mark it notified
+            let waiter = state.remove_waiter(id);
+            state.pending = false;
+            drop(state);
+            // Must set flag before notifying waiter.
+            waiter.flag.set(NOTIFIED_ONE);
+            Some(waiter)
         }
     }
 
@@ -185,6 +202,8 @@ impl Notify {
     /// already registered waiters. Registering for notification is done by
     /// acquiring an instance of the `Notified` future via calling `notified()`.
     pub fn notify_waiters(&self) {
+        // Scheduling point before the operation, which notifies the registered waiters.
+        thread::switch();
         // In tokio, `notify_waiters` takes the waiter list and marks the waiters notified under its
         // lock, so it's one operation on the `Notify`, of which the waiters' flags are part.
         let waiters = ExecutionState::atomic_step(|| {
@@ -203,7 +222,7 @@ impl Notify {
             // cleared.
             for w in &waiters {
                 // Must set flag before notifying waiter
-                let flag = w.flag.replace(NOTIFIED);
+                let flag = w.flag.replace(NOTIFIED_ALL);
                 assert!(flag == INIT || flag == ENABLED);
             }
             waiters
@@ -252,26 +271,39 @@ impl Notified<'_> {
         self.poll_inner()
     }
 
-    fn poll_inner(&self) -> bool {
+    fn poll_inner(self: Pin<&mut Self>) -> bool {
+        let this = self.project();
+        if *this.done {
+            return true;
+        }
+        // Scheduling point before the first access. A later poll follows a wake-up, at the start
+        // of a step of its own.
+        this.first_poll.switch();
+        let ready = Self::check(this.id, this.flag, this.notify);
+        *this.done = ready;
+        ready
+    }
+
+    fn check(id: &usize, flag_cell: &TrackedCell<usize>, notify: &Notify) -> bool {
         // In tokio, this checks and updates the waiter's state, and takes a stored permit, under the
         // lock of the waiter list, so it's one operation on the `Notify`.
         let consumed = ExecutionState::atomic_step(|| {
-            let flag = self.flag.get();
-            if flag == NOTIFIED {
+            let flag = flag_cell.get();
+            if is_notified(flag) {
                 return Some(None);
             }
             if flag == INIT {
                 // Not yet polled or enabled, so mark it enabled
-                self.flag.set(ENABLED);
+                flag_cell.set(ENABLED);
             }
-            let mut state = self.notify.state.borrow_mut();
+            let mut state = notify.state.borrow_mut();
             if std::mem::replace(&mut state.pending, false) {
-                trace!("waiter {} in state {:?} consuming permit", self.id, flag);
+                trace!("waiter {} in state {:?} consuming permit", *id, flag);
                 // We just consumed a permit, so mark this future ready and remove
                 // the waiter
-                let waiter = state.remove_waiter(self.id);
+                let waiter = state.remove_waiter(*id);
                 drop(state);
-                waiter.flag.set(NOTIFIED);
+                waiter.flag.set(NOTIFIED_ONE);
                 Some(Some(waiter))
             } else {
                 None
@@ -291,15 +323,18 @@ impl Notified<'_> {
 impl Future for Notified<'_> {
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        let enabled = self.poll_inner();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+        let enabled = self.as_mut().poll_inner();
         if enabled {
             Poll::Ready(())
         } else {
-            let mut this = self.project();
-            match this.rx.as_mut().poll(cx) {
+            let this = self.project();
+            match this.rx.poll(cx) {
                 Poll::Pending => Poll::Pending,
-                Poll::Ready(_) => Poll::Ready(()),
+                Poll::Ready(_) => {
+                    *this.done = true;
+                    Poll::Ready(())
+                }
             }
         }
     }
@@ -309,13 +344,33 @@ impl Future for Notified<'_> {
 impl PinnedDrop for Notified<'_> {
     fn drop(self: Pin<&mut Self>) {
         trace!("dropping waiter {:?} with flag {:?}", self.id, self.flag);
-        // In tokio, this removes the waiter under the lock of the waiter list, so it's one
-        // operation on the `Notify`.
-        ExecutionState::atomic_step(|| {
-            if self.flag.get() != NOTIFIED {
+        if self.done {
+            // The waiter was notified and removed, so there's nothing to do.
+            return;
+        }
+        // Scheduling point before the access, which can remove the waiter or pass a notification on.
+        drop_scheduling_point();
+        // In tokio, this removes the waiter, or passes the notification that `notify_one` gave it on
+        // to another waiter, under the lock of the waiter list, so it's one operation on the
+        // `Notify`.
+        let forward_to = ExecutionState::atomic_step(|| match self.flag.get() {
+            // Notified by `notify_one`, but never completed: as tokio does, pass the notification on,
+            // so that it isn't lost.
+            NOTIFIED_ONE => self.notify.notify_one_step(),
+            NOTIFIED_ALL => None,
+            _ => {
                 // If the waiter hasn't been notified, remove it from the waiter queue
                 let _ = self.notify.state.borrow_mut().remove_waiter(self.id);
+                None
             }
         });
+        if let Some(waiter) = forward_to {
+            trace!(
+                "dropped waiter {:?} passing its notification on to {:?}",
+                self.id,
+                waiter.id
+            );
+            let _ = waiter.tx.send(());
+        }
     }
 }
