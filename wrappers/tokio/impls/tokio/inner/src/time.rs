@@ -2,6 +2,7 @@
 
 use pin_project::{pin_project, pinned_drop};
 use shuttle::current::{get_current_task, with_labels_for_task, Labels, TaskId};
+use shuttle_engine::runtime::thread;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -64,6 +65,8 @@ pub fn trigger_timeouts<F>(trigger: F)
 where
     F: Fn(&Labels) -> bool + 'static,
 {
+    // Scheduling point precedes the visible expiry of the timeouts
+    thread::switch();
     let wakers = TIMEOUT_TABLE.with(|table| {
         let mut map = table.inner.lock().unwrap();
         let mut wakers = vec![];
@@ -95,6 +98,8 @@ where
 
 /// Clear all timeout triggers
 pub fn clear_triggers() {
+    // Scheduling point precedes the visible removal of the triggers
+    thread::switch();
     TIMEOUT_TABLE.with(|table| {
         table.inner.lock().unwrap().triggers.clear();
     });
@@ -103,7 +108,12 @@ pub fn clear_triggers() {
 // The Future returned by a call to `timeout(future)`.
 #[pin_project(PinnedDrop)]
 pub struct Timeout<F> {
-    slot: usize,
+    // The task that created the timeout, whose labels the triggers match
+    task_id: TaskId,
+    // The timeout's entry in `TIMEOUT_TABLE`, registered at the first poll
+    slot: Option<usize>,
+    // Whether the last poll returned `Pending`
+    poll_pending: bool,
     #[pin]
     future: F,
 }
@@ -119,30 +129,37 @@ where
         // if a timeout has been expired before polling the underlying future.
         // If the future returns `Pending`, we poll it again in case we
         // invoked the trigger while the future was being polled.
-        let slot = self.slot;
+        let this = self.project();
+        // Scheduling point precedes the read of the timeout table, except after a wake-up
+        if !*this.poll_pending {
+            thread::switch();
+        }
+        let slot = *this.slot.get_or_insert_with(|| register_timeout(*this.task_id));
         let timed_out = TIMEOUT_TABLE.with(|table| {
             let map = table.inner.lock().unwrap();
             let entry = map.entries.get(&slot).unwrap();
             matches!(entry.state, TimeoutState::Expired)
         });
-        if timed_out {
-            return Poll::Ready(Err(error::Elapsed::new()));
-        }
-        let this = self.project();
-        match this.future.poll(cx) {
-            Poll::Ready(r) => Poll::Ready(Ok(r)),
-            Poll::Pending => TIMEOUT_TABLE.with(|table| {
-                let mut map = table.inner.lock().unwrap();
-                let TimeoutEntry { state, .. } = map.entries.get_mut(&slot).unwrap();
-                match state {
-                    TimeoutState::Expired => Poll::Ready(Err(error::Elapsed::new())),
-                    TimeoutState::Waiting(waker) => {
-                        *waker = Some(cx.waker().clone());
-                        Poll::Pending
+        let poll = if timed_out {
+            Poll::Ready(Err(error::Elapsed::new()))
+        } else {
+            match this.future.poll(cx) {
+                Poll::Ready(r) => Poll::Ready(Ok(r)),
+                Poll::Pending => TIMEOUT_TABLE.with(|table| {
+                    let mut map = table.inner.lock().unwrap();
+                    let TimeoutEntry { state, .. } = map.entries.get_mut(&slot).unwrap();
+                    match state {
+                        TimeoutState::Expired => Poll::Ready(Err(error::Elapsed::new())),
+                        TimeoutState::Waiting(waker) => {
+                            *waker = Some(cx.waker().clone());
+                            Poll::Pending
+                        }
                     }
-                }
-            }),
-        }
+                }),
+            }
+        };
+        *this.poll_pending = poll.is_pending();
+        poll
     }
 }
 
@@ -150,10 +167,11 @@ where
 impl<F> PinnedDrop for Timeout<F> {
     fn drop(self: Pin<&mut Self>) {
         // On drop, remove the associated entry from the `TIMEOUT_TABLE`
+        let Some(slot) = self.slot else { return };
         TIMEOUT_TABLE.with(|table| {
             let mut map = table.inner.lock().unwrap();
-            if let Some(e) = map.entries.remove(&self.slot) {
-                trace!("removed entry {:?} at slot {}", e, self.slot);
+            if let Some(e) = map.entries.remove(&slot) {
+                trace!("removed entry {:?} at slot {}", e, slot);
             }
         });
     }
@@ -163,37 +181,44 @@ fn timeout_inner<F>(future: F) -> Timeout<F>
 where
     F: Future,
 {
-    let slot = {
-        let task_id = get_current_task().expect("TaskId should be defined");
-        // We save the debug name of the task up-front, to avoid a double-borrow of the
-        // underlying Label storage in Shuttle (needed for `with_labels_for_task`).
-        let task_name = format!("{task_id:?}");
-        with_labels_for_task(task_id, |labels| {
-            TIMEOUT_TABLE.with(|table| {
-                let mut map = table.inner.lock().unwrap();
-                let state = if map.triggers.iter().any(|trigger| trigger(labels)) {
-                    TimeoutState::Expired
-                } else {
-                    TimeoutState::Waiting(None)
-                };
-                let slot = map.next_slot;
-                map.next_slot += 1;
-                trace!(
-                    "Registering {}timeout for task {} in slot {}",
-                    match &state {
-                        TimeoutState::Expired => "(expired) ",
-                        TimeoutState::Waiting(_) => "",
-                    },
-                    task_name,
-                    slot
-                );
-                let entry = TimeoutEntry { task_id, state };
-                map.entries.insert(slot, entry);
+    Timeout {
+        task_id: get_current_task().expect("TaskId should be defined"),
+        slot: None,
+        poll_pending: false,
+        future,
+    }
+}
+
+// Register a timeout for `task_id` in `TIMEOUT_TABLE`, expired if a trigger matches the task, and
+// return its slot
+fn register_timeout(task_id: TaskId) -> usize {
+    // We save the debug name of the task up-front, to avoid a double-borrow of the
+    // underlying Label storage in Shuttle (needed for `with_labels_for_task`).
+    let task_name = format!("{task_id:?}");
+    with_labels_for_task(task_id, |labels| {
+        TIMEOUT_TABLE.with(|table| {
+            let mut map = table.inner.lock().unwrap();
+            let state = if map.triggers.iter().any(|trigger| trigger(labels)) {
+                TimeoutState::Expired
+            } else {
+                TimeoutState::Waiting(None)
+            };
+            let slot = map.next_slot;
+            map.next_slot += 1;
+            trace!(
+                "Registering {}timeout for task {} in slot {}",
+                match &state {
+                    TimeoutState::Expired => "(expired) ",
+                    TimeoutState::Waiting(_) => "",
+                },
+                task_name,
                 slot
-            })
+            );
+            let entry = TimeoutEntry { task_id, state };
+            map.entries.insert(slot, entry);
+            slot
         })
-    };
-    Timeout { slot, future }
+    })
 }
 
 /// Requires a `Future` to complete before the specified duration has elapsed.
